@@ -43,6 +43,17 @@ fn clobber_cache(file_size_gb: f64) {
     drop(buf);
 }
 
+/// Reads the argument following `args[i]` as a count. Returns the index to
+/// continue from and the parsed value (None if not present or not a number).
+fn parse_index_arg<T: std::str::FromStr>(args: &[String], i: usize) -> Option<(usize, Option<T>)> {
+    if i + 1 < args.len() {
+        let next = i + 1;
+        Some((next, args[next].parse().ok()))
+    } else {
+        None
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let json_mode = args.contains(&"--json".to_string());
@@ -63,27 +74,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--samples" => {
-                if i + 1 < args.len() {
-                    if let Ok(val) = args[i + 1].parse() {
-                        sample_count = val;
+                if let Some((next, val)) = parse_index_arg(&args, i) {
+                    if let Some(v) = val {
+                        sample_count = v;
                     }
-                    i += 1;
+                    i = next;
                 }
             }
             "--iterations" => {
-                if i + 1 < args.len() {
-                    if let Ok(val) = args[i + 1].parse() {
-                        iterations = val;
+                if let Some((next, val)) = parse_index_arg(&args, i) {
+                    if let Some(v) = val {
+                        iterations = v;
                     }
-                    i += 1;
+                    i = next;
                 }
             }
             "--warmup" => {
-                if i + 1 < args.len() {
-                    if let Ok(val) = args[i + 1].parse() {
-                        warmup = val;
+                if let Some((next, val)) = parse_index_arg(&args, i) {
+                    if let Some(v) = val {
+                        warmup = v;
                     }
-                    i += 1;
+                    i = next;
                 }
             }
             _ => {}

@@ -186,7 +186,7 @@ impl<'a> TdmsChannel<'a> {
 
     /// Return the channel data type.
     pub fn dtype(&self) -> DataType {
-        self.data.dtype.clone()
+        self.data.dtype
     }
 
     /// Return the number of values in the channel.
@@ -250,6 +250,79 @@ impl<'a> TdmsChannel<'a> {
         let file = File::open(&self.file.inner.path)?;
         let mut reader = BufReader::new(file);
         self.read_range_into_bytes(&range, out_bytes, &mut reader)?;
+        Ok(requested)
+    }
+
+    /// Read a range of string values into the provided output buffer.
+    ///
+    /// The channel must have [`DataType::String`] dtype; otherwise a
+    /// [`TdmsError::TypeMismatch`] is returned. Returns the number of strings read.
+    pub fn read_strings(&self, range: Range<usize>, out: &mut [String]) -> Result<usize> {
+        if range.end > self.data.len {
+            return Err(TdmsError::InvalidRange(
+                range.start,
+                range.end,
+                self.data.len,
+            ));
+        }
+        if self.data.dtype != DataType::String {
+            return Err(TdmsError::TypeMismatch);
+        }
+        let requested = range.end - range.start;
+        if out.len() < requested {
+            return Err(TdmsError::InvalidFormat(
+                "output buffer too small for requested range".to_string(),
+            ));
+        }
+
+        let file = File::open(&self.file.inner.path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut remaining = requested;
+        let mut current_idx = range.start;
+        let mut out_cursor = 0;
+
+        for loc in &self.data.data_locations {
+            let loc_count = loc.number_of_values as usize;
+            if current_idx >= loc_count {
+                current_idx -= loc_count;
+                continue;
+            }
+
+            let read_start = current_idx;
+            let read_count = loc_count.min(current_idx + remaining) - read_start;
+            if read_count == 0 {
+                break;
+            }
+
+            // String raw data is an array of N cumulative byte offsets followed by
+            // the concatenated UTF-8 strings.
+            reader.seek(SeekFrom::Start(loc.offset))?;
+            let mut offsets = Vec::with_capacity(loc_count + 1);
+            offsets.push(0);
+            for _ in 0..loc_count {
+                offsets.push(reader.read_u32()? as usize);
+            }
+
+            let block_len = offsets[loc_count];
+            let mut bytes = vec![0u8; block_len];
+            reader.read_exact(&mut bytes)?;
+
+            for i in read_start..read_start + read_count {
+                let s = std::str::from_utf8(&bytes[offsets[i]..offsets[i + 1]])
+                    .map_err(|_| TdmsError::StringEncoding)?;
+                out[out_cursor] = s.to_string();
+                out_cursor += 1;
+            }
+
+            remaining -= read_count;
+            current_idx = 0;
+
+            if remaining == 0 {
+                break;
+            }
+        }
+
         Ok(requested)
     }
 
@@ -369,36 +442,41 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                 let prop_count;
 
                 if raw_data_index != 0 && raw_data_index != 0xFFFFFFFF {
-                    let mut skipped = vec![0u8; raw_data_index as usize];
-                    self.reader.read_exact(&mut skipped)?;
+                    let type_code = self.reader.read_u32()?;
+                    let data_type = DataType::from_u32(type_code)?;
 
-                    if raw_data_index >= 4 {
-                        let mut slice = &skipped[0..4];
-                        let type_code = slice.read_u32()?;
-                        let data_type = DataType::from_u32(type_code)?;
+                    let mut count = 0;
+                    let mut total_size = None;
 
-                        let mut count = 0;
-                        let mut total_size = None;
+                    if data_type == DataType::String {
+                        // String index info is 24 bytes: type (4), dimension (4),
+                        // number of values (8), total size in bytes of all string
+                        // data including the per-value offset array (8). Some writers
+                        // under-report the index length in the header, so read the
+                        // fixed-size index from the stream instead of using it.
+                        self.reader.read_u32()?; // dimension (must be 1)
+                        count = self.reader.read_u64()?;
+                        total_size = Some(self.reader.read_u64()?);
+                        prop_count = self.reader.read_u32()?;
+                        raw_data_meta = Some(crate::format::metadata::RawDataMeta {
+                            data_type,
+                            number_of_values: count,
+                            total_size_bytes: total_size,
+                        });
+                    } else if raw_data_index >= 4 {
+                        // Numeric index info: the declared index length includes the
+                        // trailing 4-byte property count, so the number of properties
+                        // is stored at the end of the index region.
+                        let mut skipped = vec![0u8; (raw_data_index - 4) as usize];
+                        self.reader.read_exact(&mut skipped)?;
 
-                        if data_type == DataType::String {
-                            if raw_data_index >= 16 {
-                                let mut count_slice = &skipped[8..16];
-                                count = count_slice.read_u64()?;
-                            }
-                            if raw_data_index >= 24 {
-                                let mut size_slice = &skipped[16..24];
-                                total_size = Some(size_slice.read_u64()?);
-                            }
-                            prop_count = self.reader.read_u32()?;
-                        } else {
-                            if raw_data_index >= 16 {
-                                let mut count_slice = &skipped[8..16];
-                                count = count_slice.read_u64()?;
-                            }
-                            let start = (raw_data_index - 4) as usize;
-                            let mut end_slice = &skipped[start..];
-                            prop_count = end_slice.read_u32()?;
+                        if skipped.len() >= 12 {
+                            let mut count_slice = &skipped[4..12];
+                            count = count_slice.read_u64()?;
                         }
+                        let start = skipped.len().saturating_sub(4);
+                        let mut end_slice = &skipped[start..];
+                        prop_count = end_slice.read_u32()?;
 
                         raw_data_meta = Some(crate::format::metadata::RawDataMeta {
                             data_type,
@@ -479,16 +557,25 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
         }
 
         let mut current_raw_offset = start_pos + 28 + raw_data_offset;
+        let raw_size = |meta: &crate::format::metadata::RawDataMeta| -> u64 {
+            if meta.data_type == DataType::String {
+                meta.total_size_bytes
+                    .unwrap_or(meta.number_of_values.saturating_mul(4))
+            } else {
+                (meta.data_type.itemsize() as u64) * meta.number_of_values
+            }
+        };
+
         for obj in &mut objects {
             let path_str = obj.path.raw.clone();
             if let Some(meta) = &obj.raw_data_meta {
                 self.active_meta.insert(path_str.clone(), meta.clone());
                 if meta.number_of_values > 0 {
-                    let size = (meta.data_type.itemsize() as u64) * meta.number_of_values;
+                    let size = raw_size(meta);
                     obj.data_location = Some(crate::format::metadata::DataLocation {
                         offset: current_raw_offset,
                         number_of_values: meta.number_of_values,
-                        _data_type: meta.data_type.clone(),
+                        _data_type: meta.data_type,
                         _total_size_bytes: meta.total_size_bytes,
                     });
                     current_raw_offset += size;
@@ -496,11 +583,11 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             } else if obj.raw_data_index == 0 {
                 if let Some(meta) = self.active_meta.get(&path_str) {
                     if meta.number_of_values > 0 {
-                        let size = (meta.data_type.itemsize() as u64) * meta.number_of_values;
+                        let size = raw_size(meta);
                         obj.data_location = Some(crate::format::metadata::DataLocation {
                             offset: current_raw_offset,
                             number_of_values: meta.number_of_values,
-                            _data_type: meta.data_type.clone(),
+                            _data_type: meta.data_type,
                             _total_size_bytes: meta.total_size_bytes,
                         });
                         current_raw_offset += size;

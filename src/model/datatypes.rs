@@ -1,7 +1,7 @@
 use crate::error::{Result, TdmsError};
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     I8 = 1,
     I16 = 2,

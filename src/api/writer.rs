@@ -34,10 +34,17 @@ struct WriterGroupData {
     properties: IndexMap<String, PropertyValue>,
 }
 
+struct ChannelRawInfo {
+    dtype: DataType,
+    count: usize,
+    total_size: usize,
+}
+
 struct WriterChannelData {
     name: String,
     data_type: DataType,
     data: Vec<u8>,
+    count: usize,
     properties: IndexMap<String, PropertyValue>,
 }
 
@@ -152,11 +159,16 @@ impl TdmsWriter {
 
             for channel in group.channels.values() {
                 let channel_path = format!("/'{}'/'{}'", group.name, channel.name);
+                let raw_data_info = Some(ChannelRawInfo {
+                    dtype: channel.data_type,
+                    count: channel.count,
+                    total_size: channel.data.len(),
+                });
                 self.write_object_internal(
                     &mut writer,
                     &channel_path,
                     &channel.properties,
-                    Some((&channel.data_type, channel.data.len())),
+                    raw_data_info.as_ref(),
                 )?;
             }
         }
@@ -182,23 +194,26 @@ impl TdmsWriter {
         writer: &mut BufWriter<File>,
         path: &str,
         properties: &IndexMap<String, PropertyValue>,
-        raw_data: Option<(&DataType, usize)>,
+        raw_data: Option<&ChannelRawInfo>,
     ) -> Result<()> {
         writer.write_u32(path.len() as u32)?;
         writer.write_all(path.as_bytes())?;
 
-        let raw_data_index = if raw_data.is_some() {
-            20_u32
+        if let Some(info) = raw_data {
+            if info.dtype == DataType::String {
+                writer.write_u32(24)?;
+                writer.write_u32(info.dtype.to_u32())?;
+                writer.write_u32(1)?;
+                writer.write_u64(info.count as u64)?;
+                writer.write_u64(info.total_size as u64)?;
+            } else {
+                writer.write_u32(20)?;
+                writer.write_u32(info.dtype.to_u32())?;
+                writer.write_u32(1)?;
+                writer.write_u64(info.count as u64)?;
+            }
         } else {
-            0xFFFFFFFF_u32
-        };
-        writer.write_u32(raw_data_index)?;
-
-        if let Some((dtype, byte_len)) = raw_data {
-            writer.write_u32(dtype.to_u32())?;
-            writer.write_u32(1)?;
-            let count = byte_len / dtype.itemsize();
-            writer.write_u64(count as u64)?;
+            writer.write_u32(0xFFFFFFFF)?;
         }
 
         writer.write_u32(properties.len() as u32)?;
@@ -310,6 +325,7 @@ impl<'w> WriterGroup<'w> {
                     name: name.clone(),
                     data_type: T::data_type(),
                     data: Vec::new(),
+                    count: 0,
                     properties: IndexMap::new(),
                 },
             );
@@ -356,6 +372,7 @@ impl<'w, T: WritableType> WriterChannel<'w, T> {
         let channel = group.channels.get_mut(&self.channel_name).ok_or_else(|| {
             TdmsError::ChannelNotFound(self.channel_name.clone(), self.group_name.clone())
         })?;
+        channel.count += T::count(data);
         T::write_to_buffer(data, &mut channel.data)?;
         Ok(())
     }
@@ -389,6 +406,10 @@ impl<'w, T: WritableType> WriterChannel<'w, T> {
 pub trait WritableType: Sized {
     fn data_type() -> DataType;
     fn write_to_buffer(data: &[Self], buffer: &mut Vec<u8>) -> Result<()>;
+    /// Number of values the given slice represents (i.e. its length).
+    fn count(data: &[Self]) -> usize {
+        data.len()
+    }
 }
 
 impl WritableType for f64 {
@@ -516,6 +537,40 @@ impl WritableType for bool {
     fn write_to_buffer(data: &[Self], buffer: &mut Vec<u8>) -> Result<()> {
         for &v in data {
             buffer.write_u8(if v { 1 } else { 0 })?;
+        }
+        Ok(())
+    }
+}
+
+impl WritableType for String {
+    fn data_type() -> DataType {
+        DataType::String
+    }
+    fn write_to_buffer(data: &[Self], buffer: &mut Vec<u8>) -> Result<()> {
+        let mut offset: u32 = 0;
+        for s in data {
+            offset += s.len() as u32;
+            buffer.write_u32(offset)?;
+        }
+        for s in data {
+            buffer.write_all(s.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+impl WritableType for &str {
+    fn data_type() -> DataType {
+        DataType::String
+    }
+    fn write_to_buffer(data: &[Self], buffer: &mut Vec<u8>) -> Result<()> {
+        let mut offset: u32 = 0;
+        for s in data {
+            offset += s.len() as u32;
+            buffer.write_u32(offset)?;
+        }
+        for s in data {
+            buffer.write_all(s.as_bytes())?;
         }
         Ok(())
     }
