@@ -201,7 +201,9 @@ impl TdmsWriter {
 
         if let Some(info) = raw_data {
             if info.dtype == DataType::String {
-                writer.write_u32(24)?;
+                // The index length field includes the trailing 4-byte property
+                // count: type(4) + dimension(4) + count(8) + total_size(8) + prop count(4).
+                writer.write_u32(28)?;
                 writer.write_u32(info.dtype.to_u32())?;
                 writer.write_u32(1)?;
                 writer.write_u64(info.count as u64)?;
@@ -547,10 +549,17 @@ impl WritableType for String {
         DataType::String
     }
     fn write_to_buffer(data: &[Self], buffer: &mut Vec<u8>) -> Result<()> {
-        let mut offset: u32 = 0;
+        // Per-value offsets are u32 in the TDMS format, so reject payloads whose
+        // cumulative byte length would overflow instead of wrapping silently.
+        let mut offset: u64 = 0;
         for s in data {
-            offset += s.len() as u32;
-            buffer.write_u32(offset)?;
+            offset += s.len() as u64;
+            if offset > u32::MAX as u64 {
+                return Err(TdmsError::InvalidFormat(
+                    "string channel payload exceeds u32 offset range (4 GiB)".to_string(),
+                ));
+            }
+            buffer.write_u32(offset as u32)?;
         }
         for s in data {
             buffer.write_all(s.as_bytes())?;
@@ -564,10 +573,17 @@ impl WritableType for &str {
         DataType::String
     }
     fn write_to_buffer(data: &[Self], buffer: &mut Vec<u8>) -> Result<()> {
-        let mut offset: u32 = 0;
+        // Per-value offsets are u32 in the TDMS format, so reject payloads whose
+        // cumulative byte length would overflow instead of wrapping silently.
+        let mut offset: u64 = 0;
         for s in data {
-            offset += s.len() as u32;
-            buffer.write_u32(offset)?;
+            offset += s.len() as u64;
+            if offset > u32::MAX as u64 {
+                return Err(TdmsError::InvalidFormat(
+                    "string channel payload exceeds u32 offset range (4 GiB)".to_string(),
+                ));
+            }
+            buffer.write_u32(offset as u32)?;
         }
         for s in data {
             buffer.write_all(s.as_bytes())?;

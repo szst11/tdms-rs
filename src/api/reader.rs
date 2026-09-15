@@ -297,23 +297,22 @@ impl<'a> TdmsChannel<'a> {
 
             // String raw data is an array of N cumulative byte offsets followed by
             // the concatenated UTF-8 strings.
-            reader.seek(SeekFrom::Start(loc.offset))?;
-            let mut offsets = Vec::with_capacity(loc_count + 1);
-            offsets.push(0);
-            for _ in 0..loc_count {
-                offsets.push(reader.read_u32()? as usize);
-            }
+            let (offsets, bytes) =
+                self.read_string_block(&mut reader, loc, read_start, read_count)?;
 
-            let block_len = offsets[loc_count];
-            let mut bytes = vec![0u8; block_len];
-            reader.read_exact(&mut bytes)?;
-
-            for i in read_start..read_start + read_count {
-                let s = std::str::from_utf8(&bytes[offsets[i]..offsets[i + 1]])
-                    .map_err(|_| TdmsError::StringEncoding)?;
-                out[out_cursor] = s.to_string();
-                out_cursor += 1;
+            let start_byte = offsets[read_start];
+            for (i, slot) in out[out_cursor..out_cursor + read_count]
+                .iter_mut()
+                .enumerate()
+            {
+                let idx = read_start + i;
+                let s = std::str::from_utf8(
+                    &bytes[offsets[idx] - start_byte..offsets[idx + 1] - start_byte],
+                )
+                .map_err(|_| TdmsError::StringEncoding)?;
+                *slot = s.to_string();
             }
+            out_cursor += read_count;
 
             remaining -= read_count;
             current_idx = 0;
@@ -324,6 +323,152 @@ impl<'a> TdmsChannel<'a> {
         }
 
         Ok(requested)
+    }
+
+    /// Read a range of string values as raw buffers in Arrow's string layout.
+    ///
+    /// The channel must have [`DataType::String`] dtype; otherwise a
+    /// [`TdmsError::TypeMismatch`] is returned. Returns the number of strings read.
+    ///
+    /// `out_offsets` is cleared and filled with `range.len() + 1` cumulative
+    /// 64-bit byte offsets (first element 0, even for an empty range);
+    /// `out_bytes` is cleared and filled with the concatenated UTF-8 bytes of the
+    /// requested strings. The 64-bit offsets cover total payloads beyond 4 GiB
+    /// and are exactly what an Arrow `LargeUtf8` array needs, so downstream
+    /// consumers can build one without per-element copies. The bytes are copied
+    /// once from the file; string values spanning multiple segments are
+    /// concatenated into a single contiguous buffer.
+    pub fn read_string_buffers(
+        &self,
+        range: Range<usize>,
+        out_offsets: &mut Vec<u64>,
+        out_bytes: &mut Vec<u8>,
+    ) -> Result<usize> {
+        if range.end > self.data.len {
+            return Err(TdmsError::InvalidRange(
+                range.start,
+                range.end,
+                self.data.len,
+            ));
+        }
+        if self.data.dtype != DataType::String {
+            return Err(TdmsError::TypeMismatch);
+        }
+        let requested = range.end - range.start;
+
+        out_offsets.clear();
+        out_offsets.reserve(requested + 1);
+        out_bytes.clear();
+
+        if requested == 0 {
+            out_offsets.push(0);
+            return Ok(0);
+        }
+
+        let file = File::open(&self.file.inner.path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut remaining = requested;
+        let mut current_idx = range.start;
+
+        for loc in &self.data.data_locations {
+            let loc_count = loc.number_of_values as usize;
+            if current_idx >= loc_count {
+                current_idx -= loc_count;
+                continue;
+            }
+
+            let read_start = current_idx;
+            let read_count = loc_count.min(current_idx + remaining) - read_start;
+            if read_count == 0 {
+                break;
+            }
+
+            // String raw data is an array of N cumulative byte offsets followed by
+            // the concatenated UTF-8 strings.
+            let (raw_offsets, bytes) =
+                self.read_string_block(&mut reader, loc, read_start, read_count)?;
+
+            let base = raw_offsets[read_start];
+            let out_base = out_bytes.len();
+            if out_offsets.is_empty() {
+                out_offsets.push(out_base as u64);
+            }
+            for offset in &raw_offsets[read_start + 1..=read_start + read_count] {
+                out_offsets.push(out_base as u64 + *offset as u64 - base as u64);
+            }
+            out_bytes.extend_from_slice(&bytes);
+
+            remaining -= read_count;
+            current_idx = 0;
+
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        Ok(requested)
+    }
+
+    /// Read the string offset array for one data location and return only the
+    /// bytes for `read_start..read_start + read_count` as a contiguous slice.
+    ///
+    /// The offset array (one `u32` per value) must be read in full, but the
+    /// concatenated string bytes are sliced to the requested range instead of
+    /// materializing the whole segment block. The file-supplied offsets are
+    /// validated to be monotonic and to fit inside the file, so a corrupt input
+    /// cannot panic or trigger a huge allocation.
+    fn read_string_block(
+        &self,
+        reader: &mut BufReader<File>,
+        loc: &DataLocation,
+        read_start: usize,
+        read_count: usize,
+    ) -> Result<(Vec<usize>, Vec<u8>)> {
+        let loc_count = loc.number_of_values as usize;
+        let file_len = reader.get_ref().metadata()?.len();
+
+        reader.seek(SeekFrom::Start(loc.offset))?;
+        // A valid string block stores at least one 4-byte offset per value, so a
+        // declared count larger than what the remaining file can hold means the
+        // header is corrupt. Without this guard a crafted count would drive a
+        // multi-GiB allocation below.
+        if loc_count as u64 > file_len.saturating_sub(loc.offset) / 4 {
+            return Err(TdmsError::InvalidFormat(
+                "string channel value count exceeds file size".to_string(),
+            ));
+        }
+        let mut offsets = Vec::with_capacity(loc_count + 1);
+        offsets.push(0);
+        for _ in 0..loc_count {
+            offsets.push(reader.read_u32()? as usize);
+        }
+
+        let mut prev = 0usize;
+        for &offset in &offsets[1..] {
+            if offset < prev {
+                return Err(TdmsError::InvalidFormat(
+                    "string channel offsets must be monotonic non-decreasing".to_string(),
+                ));
+            }
+            prev = offset;
+        }
+
+        let block_len = prev;
+        let bytes_start = loc.offset + loc_count as u64 * 4;
+        if block_len as u64 > file_len.saturating_sub(bytes_start) {
+            return Err(TdmsError::InvalidFormat(
+                "string channel data exceeds remaining file size".to_string(),
+            ));
+        }
+
+        let start_byte = offsets[read_start];
+        let end_byte = offsets[read_start + read_count];
+        let mut bytes = vec![0u8; end_byte - start_byte];
+        reader.seek(SeekFrom::Start(bytes_start + start_byte as u64))?;
+        reader.read_exact(&mut bytes)?;
+
+        Ok((offsets, bytes))
     }
 
     fn read_range_into_bytes<R: std::io::Read + std::io::Seek>(
@@ -484,7 +629,10 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                             total_size_bytes: total_size,
                         });
                     } else {
-                        prop_count = 0;
+                        return Err(TdmsError::InvalidFormat(format!(
+                            "invalid raw data index length {} for non-string data type",
+                            raw_data_index
+                        )));
                     }
                 } else {
                     prop_count = self.reader.read_u32()?;

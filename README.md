@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/tdms-rs/badge.svg)](https://docs.rs/tdms-rs)
 [![License](https://img.shields.io/crates/l/tdms-rs.svg)](#license)
 
-A pure Rust library for reading and writing National Instruments TDMS (Technical Data Management Streaming) files with high performance and zero-copy capabilities.
+A pure Rust library for reading and writing National Instruments TDMS (Technical Data Management Streaming) files with high performance and efficient reads into caller-provided buffers.
 
 ## 🚀 Key Features
 
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 1.  **Memory Efficiency**: Never load data you don't ask for. Metadata is indexed; raw data is lazy-loaded.
 2.  **Safety First**: Safe wrappers around `unsafe` memory operations.
-3.  **Modern MSRV**: Supports the latest stable Rust features.
+3.  **Broad MSRV**: Supports Rust 1.70.0 and later.
 
 ## 🤝 License
 
