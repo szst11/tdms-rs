@@ -84,7 +84,13 @@ fn read_channel_data_as_json(
             return Err("timestamp channel JSON comparison not implemented".into());
         }
         DataType::String => {
-            return Err("string channel decoding not supported by new API".into());
+            let mut data = vec![String::new(); len];
+            channel.read_strings(range, &mut data)?;
+            serde_json::Value::Array(
+                data.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            )
         }
     };
 
@@ -327,7 +333,14 @@ fn run_test_case(tdms_path: &Path) {
                                 assert_eq!(a, e, "Value mismatch at {} for {}", i, c_name);
                             }
                         }
-                        DataType::TimeStamp | DataType::String => {
+                        DataType::String => {
+                            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                                let a = a.as_str().expect("expected string JSON");
+                                let e = e.as_str().expect("expected string JSON");
+                                assert_eq!(a, e, "Value mismatch at {} for {}", i, c_name);
+                            }
+                        }
+                        DataType::TimeStamp => {
                             // Explicitly not supported by the new API's typed decoding.
                         }
                     }

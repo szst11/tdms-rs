@@ -1,5 +1,5 @@
 //! Tests round-trip for all supported channel data types.
-//! String and TimeStamp channel data are intentionally excluded as they are not supported by the current typed API.
+//! TimeStamp channel data is intentionally excluded as it is not supported by the current typed API.
 
 use tdms_rs::{TdmsFile, TdmsWriter};
 
@@ -122,12 +122,48 @@ test_channel_type!(
 test_channel_type!(channel_bool, bool, &[true, false, true, false, true]);
 
 #[test]
+fn channel_string_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let path = "tests/output/channel_string.tdms";
+    std::fs::create_dir_all("tests/output")?;
+    let data = vec![
+        "Hello".to_string(),
+        "".to_string(),
+        "World".to_string(),
+        "TDMS".to_string(),
+        "File Format".to_string(),
+        "unicode: café".to_string(),
+    ];
+
+    {
+        let mut writer = TdmsWriter::create(path)?;
+        let mut group = writer.add_group("G")?;
+        let mut channel = group.add_channel::<String>("C")?;
+        channel.write(&data)?;
+    }
+
+    let file = TdmsFile::open(path)?;
+    let channel = file.group("G").unwrap().channel("C").unwrap();
+    assert_eq!(channel.len(), data.len());
+    assert_eq!(channel.dtype(), tdms_rs::DataType::String);
+
+    let mut read_back = vec![String::new(); data.len()];
+    channel.read_strings(0..data.len(), &mut read_back)?;
+    assert_eq!(read_back, data);
+
+    // Partial read across the middle
+    let mut sub = vec![String::new(); 3];
+    channel.read_strings(2..5, &mut sub)?;
+    assert_eq!(sub, data[2..5]);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
 fn channel_unsupported_types_error() -> Result<(), Box<dyn std::error::Error>> {
     let path = "tests/output/channel_unsupported.tdms";
 
-    // Note: String and TimeStamp channels are not supported by typed write API
-    // This test documents the limitation by attempting to read them as raw bytes
-    // which should fail with TypeMismatch
+    // Note: TimeStamp channels are not supported by typed write API
 
     // Create a file with a supported channel type to test reading errors
     {
