@@ -1,4 +1,5 @@
 use crate::error::{Result, TdmsError};
+use crate::format::index::{index_path_for, raw_data_size, write_index_file};
 use crate::format::metadata::ParsingMetadata;
 use crate::format::segment::Segment;
 use crate::io::ext::TdmsReadExt;
@@ -12,14 +13,20 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::Path;
 
+const LEAD_IN_LEN: u64 = 28;
+/// `next_segment_offset` value meaning the last segment is incomplete.
+const INCOMPLETE_SEGMENT_OFFSET: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
 /// A TDMS file handle for reading.
 ///
 /// This struct indexes the file structure (groups, channels, properties) on open
-/// without loading raw data into memory. The file handle is automatically closed
-/// when the TdmsFile is dropped.
+/// without loading raw data into memory. When a sibling `<file>.tdms_index`
+/// companion file exists it is used to build the metadata index (see
+/// [`format::index`](crate::format::index)), so opening a large file only scans
+/// the small index instead of the whole file. The `.tdms` data file is only
+/// opened lazily when channel data is actually read.
 pub struct TdmsFile {
     pub(crate) inner: TdmsFileInner,
-    pub(crate) file_handle: Option<BufReader<File>>,
 }
 
 /// A group within a TDMS file.
@@ -34,34 +41,196 @@ pub struct TdmsChannel<'a> {
     pub(crate) data: &'a TdmsChannelData,
 }
 
-impl TdmsFile {
-    /// Open a TDMS file for reading.
-    ///
-    /// This parses and indexes all segment metadata eagerly, but does not read
-    /// raw channel data until it is requested. The file handle is automatically
-    /// closed when the TdmsFile is dropped.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let file = File::open(path)?;
-        let mut reader = TdmsReaderInternal::new(BufReader::new(file));
+/// Options controlling how a TDMS file is opened for reading.
+///
+/// By default the reader looks for a sibling `<file>.tdms_index` companion
+/// index and uses it to build the metadata index quickly. If the index is
+/// missing, empty, or older than the data file it is skipped and (re)generated
+/// from the data file on the fly. Index generation is best-effort, so opening a
+/// file in a read-only directory still succeeds. Both behaviors can be disabled,
+/// and index contents can be verified against the data file.
+///
+/// # Example
+///
+/// ```no_run
+/// use tdms_rs::{TdmsFile, OpenOptions};
+///
+/// # fn main() -> Result<(), tdms_rs::TdmsError> {
+/// let _file = OpenOptions::new()
+///     .use_index_file(true)
+///     .verify_index(true)
+///     .open("data.tdms")?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct OpenOptions {
+    use_index_file: bool,
+    create_index_if_missing: bool,
+    verify_index: bool,
+}
 
+#[allow(clippy::derivable_impls)]
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            use_index_file: true,
+            create_index_if_missing: true,
+            verify_index: false,
+        }
+    }
+}
+
+impl OpenOptions {
+    /// Create options with defaults:
+    /// * index files are used when present,
+    /// * a missing index is generated on the fly,
+    /// * index contents are not verified.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a sibling `.tdms_index` file should be used to build the
+    /// metadata index. Defaults to `true`.
+    pub fn use_index_file(mut self, on: bool) -> Self {
+        self.use_index_file = on;
+        self
+    }
+
+    /// When no usable index file is present (missing, empty, or stale), write
+    /// one next to the data file while opening so future opens are fast. The
+    /// write is best-effort and never fails the open. Only takes effect when
+    /// index files are enabled. Defaults to `true`.
+    pub fn create_index_if_missing(mut self, on: bool) -> Self {
+        self.create_index_if_missing = on;
+        self
+    }
+
+    /// Verify that the `.tdms_index` file matches the `.tdms` data file by
+    /// parsing both and comparing the resulting metadata. Defaults to `false`.
+    ///
+    /// This re-reads the data file, so it costs roughly the same as a no-index
+    /// open. It is the reliable check against stale indexes: the automatic
+    /// staleness detection compares modification times, which have limited
+    /// granularity on some filesystems.
+    pub fn verify_index(mut self, on: bool) -> Self {
+        self.verify_index = on;
+        self
+    }
+
+    /// Open a TDMS file for reading using these options.
+    ///
+    /// When an index is used it must be present, non-empty, and not older than
+    /// the data file; a stale or invalid index is skipped in favor of parsing
+    /// the data file (and regenerating the index, if enabled).
+    pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<TdmsFile> {
+        let path = path.as_ref();
+        let index_path = index_path_for(path);
+
+        if self.is_index_usable(&index_path, path) {
+            // A corrupt-but-non-empty index (e.g. truncated by a crash or a
+            // concurrent open) is treated like a stale one: fall back to the
+            // data file rather than failing an otherwise-readable open.
+            if let Ok((segments, implied_end)) = Self::parse_segments_from_path(&index_path, true) {
+                // A truncated index that happens to end on a segment boundary
+                // parses without error. Such a cut makes the index describe
+                // fewer segments than the data file actually holds, so compare
+                // the implied end-of-data position against the real file length
+                // (a stat, not a read). Verification is exempt: it inspects the
+                // index by design and reports the mismatch itself.
+                let covers_data = self.verify_index
+                    || matches!(std::fs::metadata(path), Ok(m) if m.len() == implied_end);
+                if covers_data {
+                    let inner = Self::build_inner(path, &segments);
+
+                    if self.verify_index {
+                        let (data_segments, _) = Self::parse_segments_from_path(path, false)?;
+                        let data_inner = Self::build_inner(path, &data_segments);
+                        if inner != data_inner {
+                            return Err(TdmsError::IndexMismatch(
+                                "index file structure does not match the data file".to_string(),
+                            ));
+                        }
+                    }
+
+                    return Ok(TdmsFile { inner });
+                }
+            }
+        }
+
+        let (segments, _) = Self::parse_segments_from_path(path, false)?;
+        let inner = Self::build_inner(path, &segments);
+
+        if self.use_index_file && self.create_index_if_missing {
+            // The index is an optimization only: a write failure here (e.g.
+            // a read-only directory) must not fail an otherwise-readable
+            // open, so generation is best-effort.
+            let _ = write_index_file(&index_path, &segments);
+        }
+
+        Ok(TdmsFile { inner })
+    }
+
+    /// Decide whether a sibling index file can be trusted for this open.
+    fn is_index_usable(&self, index_path: &Path, data_path: &Path) -> bool {
+        if !self.use_index_file || !index_path.is_file() {
+            return false;
+        }
+
+        // A zero-length index is invalid (e.g. a crash during creation) and
+        // would silently hide a readable data file; treat it as missing.
+        if index_path.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+            return false;
+        }
+
+        // Refuse to trust a stale index: if the data file was modified more
+        // recently than the index, the index may describe outdated contents.
+        // When the mtimes cannot be compared, err on the side of the data file.
+        match (
+            index_path.metadata().and_then(|m| m.modified()),
+            data_path.metadata().and_then(|m| m.modified()),
+        ) {
+            (Ok(index_mtime), Ok(data_mtime)) => index_mtime >= data_mtime,
+            _ => false,
+        }
+    }
+
+    fn is_eof_error(e: &std::io::Error) -> bool {
+        e.kind() == std::io::ErrorKind::UnexpectedEof
+            || (e.kind() == std::io::ErrorKind::Other && e.to_string().contains("UnexpectedEof"))
+    }
+
+    fn parse_segments_from_path(path: &Path, is_index_file: bool) -> Result<(Vec<Segment>, u64)> {
+        let file = File::open(path)?;
+        let mut reader = TdmsReaderInternal::new(BufReader::new(file), is_index_file);
+        let mut segments = Vec::new();
+
+        loop {
+            match reader.read_segment() {
+                Ok(Some(segment)) => segments.push(segment),
+                Ok(None) => break,
+                // Tolerate a truncated tail in the data file (e.g. an in-flight
+                // append) by returning the segments parsed so far. For an index
+                // file any truncation is corruption: report it so the caller can
+                // fall back to the data file instead of trusting a partial index.
+                Err(TdmsError::Io(e)) if !is_index_file && Self::is_eof_error(&e) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // The reader tracks the data-file position where the next segment would
+        // start; after the last segment this equals the end of the data file the
+        // index describes. Comparing it against the actual file length catches an
+        // index truncated exactly on a segment boundary, which parses as a clean
+        // EOF and would otherwise be trusted silently.
+        Ok((segments, reader.data_segment_start))
+    }
+
+    fn build_inner(path: &Path, segments: &[Segment]) -> TdmsFileInner {
         let mut groups = IndexMap::new();
         let mut file_properties = IndexMap::new();
 
-        loop {
-            let segment = match reader.read_segment() {
-                Ok(s) => s,
-                Err(TdmsError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(TdmsError::Io(e))
-                    if e.kind() == std::io::ErrorKind::Other
-                        && e.to_string().contains("UnexpectedEof") =>
-                {
-                    break
-                }
-                Err(e) => return Err(e),
-            };
-
-            for obj in segment.objects {
+        for segment in segments {
+            for obj in &segment.objects {
                 if let Some(g_name) = obj.path.group_name() {
                     let group = groups
                         .entry(g_name.to_string())
@@ -83,9 +252,9 @@ impl TdmsFile {
                                 }
                             });
 
-                        channel.properties.extend(obj.properties);
+                        channel.properties.extend(obj.properties.clone());
 
-                        if let Some(loc) = obj.data_location {
+                        if let Some(loc) = &obj.data_location {
                             channel.len += loc.number_of_values as usize;
                             channel.data_locations.push(DataLocation {
                                 offset: loc.offset,
@@ -93,29 +262,36 @@ impl TdmsFile {
                             });
                         }
 
-                        if let Some(meta) = obj.raw_data_meta {
+                        if let Some(meta) = &obj.raw_data_meta {
                             channel.dtype = meta.data_type;
                         }
                     } else {
-                        group.properties.extend(obj.properties);
+                        group.properties.extend(obj.properties.clone());
                     }
                 } else if obj.path.is_root() {
-                    file_properties.extend(obj.properties);
+                    file_properties.extend(obj.properties.clone());
                 }
             }
         }
 
-        // Reopen the file for data reading
-        let file_handle = BufReader::new(File::open(path)?);
+        TdmsFileInner {
+            path: path.to_path_buf(),
+            groups,
+            properties: file_properties,
+        }
+    }
+}
 
-        Ok(Self {
-            inner: TdmsFileInner {
-                path: path.to_path_buf(),
-                groups,
-                properties: file_properties,
-            },
-            file_handle: Some(file_handle),
-        })
+impl TdmsFile {
+    /// Open a TDMS file for reading.
+    ///
+    /// This parses and indexes all segment metadata eagerly, but does not read
+    /// raw channel data until it is requested. When a sibling `.tdms_index`
+    /// companion file exists it is used for the metadata index (a missing,
+    /// empty, or stale index is skipped and the data file is parsed instead;
+    /// see [`OpenOptions`]).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        OpenOptions::new().open(path)
     }
 
     /// Look up a group by name.
@@ -237,16 +413,9 @@ impl<'a> TdmsChannel<'a> {
             )
         };
 
-        // Use the owned file handle, creating a new one if needed
-        let _file_handle = self.file.file_handle.as_ref().ok_or_else(|| {
-            TdmsError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "File handle not available",
-            ))
-        })?;
-
-        // We need to seek independently, so we'll create a new reader from the file
-        // This is necessary because we can't have multiple mutable borrows
+        // Open the data file lazily and seek to the requested offsets.
+        // `TdmsFile` itself does not hold the file open; a handle is created
+        // per read so opening (even via a `.tdms_index`) never touches the data.
         let file = File::open(&self.file.inner.path)?;
         let mut reader = BufReader::new(file);
         self.read_range_into_bytes(&range, out_bytes, &mut reader)?;
@@ -540,32 +709,73 @@ impl Pod for bool {}
 
 struct TdmsReaderInternal<R: Read + Seek> {
     reader: R,
+    is_index_file: bool,
+    /// Start of the current segment as it appears in the `.tdms` data file.
+    ///
+    /// For the data file this always equals the physical stream position. For
+    /// an index file the physical position skips the raw data of earlier
+    /// segments, so the data-file equivalent must be tracked separately: raw
+    /// data locations are resolved against the data file, not the index.
+    data_segment_start: u64,
     active_meta: std::collections::HashMap<String, crate::format::metadata::RawDataMeta>,
     object_order: Vec<String>,
 }
 
 impl<R: Read + Seek> TdmsReaderInternal<R> {
-    fn new(reader: R) -> Self {
+    fn new(reader: R, is_index_file: bool) -> Self {
         Self {
             reader,
+            is_index_file,
+            data_segment_start: 0,
             active_meta: std::collections::HashMap::new(),
             object_order: Vec::new(),
         }
     }
 
-    fn read_segment(&mut self) -> Result<Segment> {
+    /// Read one segment. Returns `Ok(None)` when the reader is positioned
+    /// exactly at a clean end-of-file; returns `Ok(Some(..))` for a parsed
+    /// segment. Any truncation *inside* a segment is an error — for index
+    /// files that means the caller can fall back to the data file instead of
+    /// trusting a partially-written index.
+    fn read_segment(&mut self) -> Result<Option<Segment>> {
         let start_pos = self.reader.stream_position()?;
-        let mut lead_in = [0u8; 4];
-        self.reader.read_exact(&mut lead_in)?;
 
-        if &lead_in != b"TDSm" {
+        // Read the whole 28-byte lead-in rather than byte-by-byte so a clean
+        // boundary can be told apart from a truncated header.
+        let mut lead_in = [0u8; 28];
+        let mut filled = 0;
+        while filled < 28 {
+            let n = match self.reader.read(&mut lead_in[filled..]) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => other?,
+            };
+            match n {
+                0 if filled == 0 => return Ok(None),
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled < 28 {
+            if self.is_index_file {
+                return Err(TdmsError::InvalidFormat(
+                    "truncated segment lead-in: index file ends mid-header".to_string(),
+                ));
+            }
+            // Tolerate a trailing partial segment in a data file so files that
+            // are still being appended can be opened for their completed parts.
+            return Ok(None);
+        }
+
+        let expected = if self.is_index_file { b"TDSh" } else { b"TDSm" };
+        if lead_in[..4] != *expected {
             return Err(TdmsError::InvalidSignature);
         }
 
-        let mask_val = self.reader.read_u32()?;
-        let version = self.reader.read_u32()?;
-        let next_segment_offset = self.reader.read_u64()?;
-        let raw_data_offset = self.reader.read_u64()?;
+        let mut lead = &lead_in[4..];
+        let mask_val = lead.read_u32()?;
+        let version = lead.read_u32()?;
+        let next_segment_offset = lead.read_u64()?;
+        let raw_data_offset = lead.read_u64()?;
 
         let mask = crate::format::segment::Mask::new(mask_val);
         let mut objects = Vec::new();
@@ -704,22 +914,15 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             }
         }
 
-        let mut current_raw_offset = start_pos + 28 + raw_data_offset;
-        let raw_size = |meta: &crate::format::metadata::RawDataMeta| -> u64 {
-            if meta.data_type == DataType::String {
-                meta.total_size_bytes
-                    .unwrap_or(meta.number_of_values.saturating_mul(4))
-            } else {
-                (meta.data_type.itemsize() as u64) * meta.number_of_values
-            }
-        };
+        let data_start = self.data_segment_start;
+        let mut current_raw_offset = data_start + LEAD_IN_LEN + raw_data_offset;
 
         for obj in &mut objects {
             let path_str = obj.path.raw.clone();
             if let Some(meta) = &obj.raw_data_meta {
                 self.active_meta.insert(path_str.clone(), meta.clone());
                 if meta.number_of_values > 0 {
-                    let size = raw_size(meta);
+                    let size = raw_data_size(meta);
                     obj.data_location = Some(crate::format::metadata::DataLocation {
                         offset: current_raw_offset,
                         number_of_values: meta.number_of_values,
@@ -731,7 +934,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             } else if obj.raw_data_index == 0 {
                 if let Some(meta) = self.active_meta.get(&path_str) {
                     if meta.number_of_values > 0 {
-                        let size = raw_size(meta);
+                        let size = raw_data_size(meta);
                         obj.data_location = Some(crate::format::metadata::DataLocation {
                             offset: current_raw_offset,
                             number_of_values: meta.number_of_values,
@@ -744,8 +947,25 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             }
         }
 
-        let target_pos = if next_segment_offset != 0xFFFFFFFFFFFFFFFF {
-            start_pos + 28 + next_segment_offset
+        // For an index file there is no raw data, so the following segment
+        // starts directly where this segment's metadata ends. This is more
+        // robust than assuming `raw_data_offset` equals the metadata size
+        // (which is only true for files without metadata padding).
+        let metadata_end = self.reader.stream_position()?;
+        let target_pos = if self.is_index_file {
+            metadata_end
+        } else if next_segment_offset != INCOMPLETE_SEGMENT_OFFSET {
+            start_pos + LEAD_IN_LEN + next_segment_offset
+        } else {
+            current_raw_offset
+        };
+
+        // Advance the data-file segment start for the next segment. The data
+        // file reserves space for the raw data written here, so consecutive
+        // segments are `28 + next_segment_offset` bytes apart (or `current_raw_offset`
+        // when the offset is incomplete).
+        self.data_segment_start = if next_segment_offset != INCOMPLETE_SEGMENT_OFFSET {
+            data_start + LEAD_IN_LEN + next_segment_offset
         } else {
             current_raw_offset
         };
@@ -755,20 +975,12 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             self.reader.seek(SeekFrom::Start(target_pos))?;
         }
 
-        Ok(Segment {
+        Ok(Some(Segment {
             _version: version,
             _next_segment_offset: next_segment_offset,
             _raw_data_offset: raw_data_offset,
             _toc_mask: mask.convert(),
             objects,
-        })
-    }
-}
-
-impl Drop for TdmsFile {
-    fn drop(&mut self) {
-        // The file handle will be automatically closed when dropped
-        // This is just for documentation purposes
-        self.file_handle.take();
+        }))
     }
 }

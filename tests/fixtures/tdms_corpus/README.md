@@ -2,26 +2,25 @@
 
 This directory contains the golden reference files used for integration and correctness testing.
 
+Every `.tdms` file has a companion `.tdms_index` file (written by `nptdms` with `index_file=True`), so the tests also exercise index-file-based reads.
+
 ## Regenerating Fixtures
 
-If you need to update or regenerate these files, use the Python scripts provided in the `tools/` directory.
-
-### Requirements
-- Python 3.7+
-- `nptdms` library: `pip install nptdms`
+If you need to update or regenerate these files, use the Python scripts provided in the `tools/` directory (managed via `uv`; dependencies are listed in `requirements.txt` at the repo root).
 
 ### Steps
-1. Navigate to the `tools/` directory:
+1. From this directory (`tests/fixtures/`), run the corpus generator:
    ```bash
-   cd tools/
+   uv run --with-requirements ../../requirements.txt python ../../tools/generate_corpus.py
    ```
-2. Run the corpus generator:
+   The scripts use relative `CORPUS_DIR = "tdms_corpus"`, so they must be run with this directory as the working directory (not from `tools/`).
+2. Regenerate the golden JSON references:
    ```bash
-   python generate_corpus.py
+   uv run --with-requirements ../../requirements.txt python ../../tools/generate_json.py
    ```
-3. (Optional) Validate the generated files against their expected JSON representation:
+3. Validate the generated files against their JSON representation:
    ```bash
-   python validate_json.py
+   uv run --with-requirements ../../requirements.txt python ../../tools/validate_json.py
    ```
 
 ## Structure
@@ -30,4 +29,4 @@ If you need to update or regenerate these files, use the Python scripts provided
 - `06_properties/`: Nested metadata scenarios.
 - ... and so on.
 
-The Rust tests in `tests/golden_tests.rs` iterate through these directories to ensure `tdms-rs` can parse them correctly and match the expected values.
+The Rust tests in `tests/golden_tests/` iterate through these directories to ensure `tdms-rs` can parse them correctly and match the expected values.

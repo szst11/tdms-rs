@@ -3,6 +3,8 @@
 
 use tdms_rs::{TdmsFile, TdmsWriter};
 
+use super::common::remove_tdms;
+
 macro_rules! test_channel_type {
     ($test_name:ident, $ty:ty, $data:expr) => {
         #[test]
@@ -30,7 +32,7 @@ macro_rules! test_channel_type {
             channel.read(0..$data.len(), &mut read_back)?;
             assert_eq!(read_back, $data);
 
-            std::fs::remove_file(path)?;
+            remove_tdms(path);
             Ok(())
         }
     };
@@ -155,7 +157,7 @@ fn channel_string_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     channel.read_strings(2..5, &mut sub)?;
     assert_eq!(sub, data[2..5]);
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }
 
@@ -184,6 +186,6 @@ fn channel_unsupported_types_error() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0i32; 3];
     assert!(channel.read(0..3, &mut buf).is_err()); // TypeMismatch
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }

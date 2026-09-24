@@ -3,6 +3,8 @@
 
 use tdms_rs::{PropertyValue, TdmsFile, TdmsWriter};
 
+use super::common::remove_tdms;
+
 #[test]
 fn file_properties_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let path = "tests/output/file_props.tdms";
@@ -60,7 +62,7 @@ fn file_properties_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_prop!("string", String, "test".to_string());
     assert_prop!("ts", TimeStamp, (1609459200, 123456789));
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }
 
@@ -112,6 +114,6 @@ fn group_and_channel_properties_roundtrip() -> Result<(), Box<dyn std::error::Er
         _ => panic!("Missing or wrong c_bool"),
     }
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }

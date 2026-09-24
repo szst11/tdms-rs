@@ -1,4 +1,7 @@
 use crate::error::{Result, TdmsError};
+use crate::format::index::{
+    index_path_for, write_lead_in, write_object_metadata, DATA_TAG, INDEX_TAG,
+};
 use crate::io::ext::TdmsWriteExt;
 use crate::model::datatypes::{DataType, PropertyValue};
 use indexmap::IndexMap;
@@ -7,6 +10,13 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+
+/// The lead-in is 28 bytes; the `raw_data_offset` field starts at byte 20.
+const RAW_DATA_OFFSET_FIELD_POS: u64 = 20;
+/// ToC mask used for segments written by this crate.
+const TOC_MASK: u32 = 0x0E;
+/// TDMS format version written by this crate.
+const TDMS_VERSION: u32 = 4712;
 
 /// A TDMS file writer.
 ///
@@ -24,6 +34,7 @@ use std::path::{Path, PathBuf};
 /// The writer is move-only and automatically flushes data when dropped.
 pub struct TdmsWriter {
     path: PathBuf,
+    write_index_file: bool,
     groups: IndexMap<String, WriterGroupData>,
     properties: IndexMap<String, PropertyValue>,
 }
@@ -32,12 +43,6 @@ struct WriterGroupData {
     name: String,
     channels: BTreeMap<String, WriterChannelData>,
     properties: IndexMap<String, PropertyValue>,
-}
-
-struct ChannelRawInfo {
-    dtype: DataType,
-    count: usize,
-    total_size: usize,
 }
 
 struct WriterChannelData {
@@ -61,11 +66,61 @@ pub struct WriterChannel<'w, T> {
     pub(crate) _phantom: PhantomData<T>,
 }
 
+/// Options controlling how a [`TdmsWriter`] is created.
+///
+/// By default only the `.tdms` data file is written. Enable
+/// [`write_index_file`](Self::write_index_file) to also emit a companion
+/// `.tdms_index` acceleration index (see [`crate::format::index`]).
+///
+/// # Example
+///
+/// ```no_run
+/// use tdms_rs::TdmsWriterOptions;
+///
+/// # fn main() -> Result<(), tdms_rs::TdmsError> {
+/// let writer = TdmsWriterOptions::new()
+///     .write_index_file(true)
+///     .create("out.tdms")?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default)]
+pub struct TdmsWriterOptions {
+    write_index_file: bool,
+}
+
+impl TdmsWriterOptions {
+    /// Create options with defaults (no index file written).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// When enabled, a `<file>.tdms_index` file is written next to the data
+    /// file on every flush.
+    pub fn write_index_file(mut self, on: bool) -> Self {
+        self.write_index_file = on;
+        self
+    }
+
+    /// Create a writer using these options.
+    pub fn create(self, path: impl AsRef<Path>) -> Result<TdmsWriter> {
+        TdmsWriter::create_inner(path, self.write_index_file)
+    }
+}
+
 impl TdmsWriter {
     /// Create a new TDMS writer targeting the given output path.
+    ///
+    /// Only the `.tdms` data file is written. Use
+    /// [`TdmsWriterOptions`] to also emit a companion `.tdms_index`.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        TdmsWriterOptions::new().create(path)
+    }
+
+    pub(crate) fn create_inner(path: impl AsRef<Path>, write_index_file: bool) -> Result<Self> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
+            write_index_file,
             groups: IndexMap::new(),
             properties: IndexMap::new(),
         })
@@ -126,19 +181,11 @@ impl TdmsWriter {
     }
 
     fn write_file(&mut self) -> Result<()> {
-        let file = File::create(&self.path)?;
-        let mut writer = BufWriter::new(file);
+        // Serialize the object metadata once and reuse it for both the data and
+        // index files so the two are guaranteed to describe identical metadata.
+        let mut metadata: Vec<u8> = Vec::new();
 
-        writer.write_all(b"TDSm")?;
-        let toc = 0x0E;
-        writer.write_u32(toc)?;
-        writer.write_u32(4712)?;
-
-        let segment_offset_pos = writer.stream_position()?;
-        writer.write_u64(0xFFFFFFFFFFFFFFFF)?;
-        writer.write_u64(0)?;
-
-        let mut object_count = 0;
+        let mut object_count = 0u32;
         if !self.properties.is_empty() {
             object_count += 1;
         }
@@ -147,33 +194,70 @@ impl TdmsWriter {
             object_count += group.channels.len() as u32;
         }
 
-        writer.write_u32(object_count)?;
+        metadata.write_u32(object_count)?;
 
         if !self.properties.is_empty() {
-            self.write_object_internal(&mut writer, "/", &self.properties, None)?;
+            write_object_metadata(
+                &mut metadata,
+                "/",
+                None,
+                self.properties.len(),
+                self.properties.iter(),
+            )?;
         }
 
+        let mut data_size = 0u64;
         for group in self.groups.values() {
             let group_path = format!("/'{}'", group.name);
-            self.write_object_internal(&mut writer, &group_path, &group.properties, None)?;
+            write_object_metadata(
+                &mut metadata,
+                &group_path,
+                None,
+                group.properties.len(),
+                group.properties.iter(),
+            )?;
 
             for channel in group.channels.values() {
                 let channel_path = format!("/'{}'/'{}'", group.name, channel.name);
-                let raw_data_info = Some(ChannelRawInfo {
-                    dtype: channel.data_type,
-                    count: channel.count,
-                    total_size: channel.data.len(),
-                });
-                self.write_object_internal(
-                    &mut writer,
+                let total_size_bytes = if channel.data_type == DataType::String {
+                    Some(channel.data.len() as u64)
+                } else {
+                    None
+                };
+                let raw = Some((channel.data_type, channel.count as u64, total_size_bytes));
+                write_object_metadata(
+                    &mut metadata,
                     &channel_path,
-                    &channel.properties,
-                    raw_data_info.as_ref(),
+                    raw,
+                    channel.properties.len(),
+                    channel.properties.iter(),
                 )?;
+                data_size += channel.data.len() as u64;
             }
         }
 
-        let raw_data_offset = writer.stream_position()?;
+        self.write_data_file(&metadata)?;
+        if self.write_index_file {
+            self.write_index_data(&metadata, data_size)?;
+        }
+        Ok(())
+    }
+
+    /// Write the `.tdms` data file (lead-in + metadata + raw channel data).
+    fn write_data_file(&self, metadata: &[u8]) -> Result<()> {
+        let file = File::create(&self.path)?;
+        let mut writer = BufWriter::new(file);
+
+        write_lead_in(
+            &mut writer,
+            &DATA_TAG,
+            TOC_MASK,
+            TDMS_VERSION,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0,
+        )?;
+        writer.write_all(metadata)?;
+
         for group in self.groups.values() {
             for channel in group.channels.values() {
                 writer.write_all(&channel.data)?;
@@ -181,113 +265,31 @@ impl TdmsWriter {
         }
 
         let end_pos = writer.stream_position()?;
-        writer.seek(std::io::SeekFrom::Start(segment_offset_pos + 8))?;
-        writer.write_u64(raw_data_offset - 28)?;
+        writer.seek(std::io::SeekFrom::Start(RAW_DATA_OFFSET_FIELD_POS))?;
+        writer.write_u64(metadata.len() as u64)?;
         writer.seek(std::io::SeekFrom::Start(end_pos))?;
 
         writer.flush()?;
         Ok(())
     }
 
-    fn write_object_internal(
-        &self,
-        writer: &mut BufWriter<File>,
-        path: &str,
-        properties: &IndexMap<String, PropertyValue>,
-        raw_data: Option<&ChannelRawInfo>,
-    ) -> Result<()> {
-        writer.write_u32(path.len() as u32)?;
-        writer.write_all(path.as_bytes())?;
+    /// Write the companion `.tdms_index` file (lead-in + metadata only).
+    fn write_index_data(&self, metadata: &[u8], data_size: u64) -> Result<()> {
+        let index_path = index_path_for(&self.path);
+        let file = File::create(index_path)?;
+        let mut writer = BufWriter::new(file);
 
-        if let Some(info) = raw_data {
-            if info.dtype == DataType::String {
-                // The index length field includes the trailing 4-byte property
-                // count: type(4) + dimension(4) + count(8) + total_size(8) + prop count(4).
-                writer.write_u32(28)?;
-                writer.write_u32(info.dtype.to_u32())?;
-                writer.write_u32(1)?;
-                writer.write_u64(info.count as u64)?;
-                writer.write_u64(info.total_size as u64)?;
-            } else {
-                writer.write_u32(20)?;
-                writer.write_u32(info.dtype.to_u32())?;
-                writer.write_u32(1)?;
-                writer.write_u64(info.count as u64)?;
-            }
-        } else {
-            writer.write_u32(0xFFFFFFFF)?;
-        }
+        write_lead_in(
+            &mut writer,
+            &INDEX_TAG,
+            TOC_MASK,
+            TDMS_VERSION,
+            metadata.len() as u64 + data_size,
+            metadata.len() as u64,
+        )?;
+        writer.write_all(metadata)?;
 
-        writer.write_u32(properties.len() as u32)?;
-        for (key, value) in properties {
-            writer.write_u32(key.len() as u32)?;
-            writer.write_all(key.as_bytes())?;
-            self.write_property_value_internal(writer, value)?;
-        }
-        Ok(())
-    }
-
-    fn write_property_value_internal(
-        &self,
-        writer: &mut BufWriter<File>,
-        value: &PropertyValue,
-    ) -> Result<()> {
-        match value {
-            PropertyValue::I8(v) => {
-                writer.write_u32(DataType::I8.to_u32())?;
-                writer.write_i8(*v)?;
-            }
-            PropertyValue::I16(v) => {
-                writer.write_u32(DataType::I16.to_u32())?;
-                writer.write_i16(*v)?;
-            }
-            PropertyValue::I32(v) => {
-                writer.write_u32(DataType::I32.to_u32())?;
-                writer.write_i32(*v)?;
-            }
-            PropertyValue::I64(v) => {
-                writer.write_u32(DataType::I64.to_u32())?;
-                writer.write_i64(*v)?;
-            }
-            PropertyValue::U8(v) => {
-                writer.write_u32(DataType::U8.to_u32())?;
-                writer.write_u8(*v)?;
-            }
-            PropertyValue::U16(v) => {
-                writer.write_u32(DataType::U16.to_u32())?;
-                writer.write_u16(*v)?;
-            }
-            PropertyValue::U32(v) => {
-                writer.write_u32(DataType::U32.to_u32())?;
-                writer.write_u32(*v)?;
-            }
-            PropertyValue::U64(v) => {
-                writer.write_u32(DataType::U64.to_u32())?;
-                writer.write_u64(*v)?;
-            }
-            PropertyValue::Float(v) => {
-                writer.write_u32(DataType::Float.to_u32())?;
-                writer.write_f32(*v)?;
-            }
-            PropertyValue::Double(v) => {
-                writer.write_u32(DataType::Double.to_u32())?;
-                writer.write_f64(*v)?;
-            }
-            PropertyValue::String(s) => {
-                writer.write_u32(DataType::String.to_u32())?;
-                writer.write_u32(s.len() as u32)?;
-                writer.write_all(s.as_bytes())?;
-            }
-            PropertyValue::Boolean(b) => {
-                writer.write_u32(DataType::Boolean.to_u32())?;
-                writer.write_u8(if *b { 1 } else { 0 })?;
-            }
-            PropertyValue::TimeStamp((secs, frac)) => {
-                writer.write_u32(DataType::TimeStamp.to_u32())?;
-                writer.write_u64(*frac)?;
-                writer.write_i64(*secs)?;
-            }
-        }
+        writer.flush()?;
         Ok(())
     }
 }

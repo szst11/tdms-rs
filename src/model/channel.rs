@@ -1,6 +1,7 @@
 use crate::model::datatypes::{DataType, PropertyValue};
 use indexmap::IndexMap;
 
+#[derive(PartialEq)]
 pub struct TdmsChannelData {
     pub name: String,
     pub dtype: DataType,
@@ -9,7 +10,7 @@ pub struct TdmsChannelData {
     pub properties: IndexMap<String, PropertyValue>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataLocation {
     pub offset: u64,
     pub number_of_values: u64,

@@ -59,6 +59,9 @@ pub enum TdmsError {
 
     #[error("File closed")]
     Closed,
+
+    #[error("TDMS index file does not match the TDMS data file: {0}")]
+    IndexMismatch(String),
 }
 
 pub type Result<T> = std::result::Result<T, TdmsError>;

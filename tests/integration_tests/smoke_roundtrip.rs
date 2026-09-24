@@ -3,6 +3,8 @@
 
 use tdms_rs::{TdmsFile, TdmsWriter};
 
+use super::common::remove_tdms;
+
 #[test]
 fn smoke_roundtrip_f64() -> Result<(), Box<dyn std::error::Error>> {
     let path = "tests/output/smoke_roundtrip_f64.tdms";
@@ -30,7 +32,7 @@ fn smoke_roundtrip_f64() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(data, &[1.0, 2.0, 3.0, 4.0, 5.0]);
 
     // Clean up
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }
 
@@ -59,6 +61,6 @@ fn smoke_roundtrip_bool() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(data, &[true, false, true, false, true]);
 
     // Clean up
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }
