@@ -3,6 +3,8 @@
 
 use tdms_rs::{TdmsFile, TdmsWriter};
 
+use super::common::remove_tdms;
+
 #[test]
 fn read_invalid_range() -> Result<(), Box<dyn std::error::Error>> {
     let path = "tests/output/read_invalid_range.tdms";
@@ -51,7 +53,7 @@ fn read_invalid_range() -> Result<(), Box<dyn std::error::Error>> {
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), 0);
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }
 
@@ -81,7 +83,7 @@ fn read_buffer_too_small() -> Result<(), Box<dyn std::error::Error>> {
         _ => panic!("Expected InvalidFormat error for buffer too small"),
     }
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }
 
@@ -109,7 +111,7 @@ fn read_type_mismatch() -> Result<(), Box<dyn std::error::Error>> {
         _ => panic!("Expected TypeMismatch error"),
     }
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }
 
@@ -142,6 +144,6 @@ fn read_empty_channel() -> Result<(), Box<dyn std::error::Error>> {
     let result = channel.read(0..1, &mut buf);
     assert!(result.is_err());
 
-    std::fs::remove_file(path)?;
+    remove_tdms(path);
     Ok(())
 }

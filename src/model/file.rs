@@ -3,6 +3,7 @@ use crate::model::group::TdmsGroupData;
 use indexmap::IndexMap;
 use std::path::PathBuf;
 
+#[derive(PartialEq)]
 pub struct TdmsFileInner {
     pub path: PathBuf,
     pub groups: IndexMap<String, TdmsGroupData>,
