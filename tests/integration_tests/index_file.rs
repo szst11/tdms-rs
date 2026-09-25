@@ -120,6 +120,30 @@ fn open_without_index_recreates_index() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
+fn generated_index_preserves_multiple_segment_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    create_dir()?;
+    let fixture = "tests/fixtures/tdms_corpus/02_structure_variants/multiple_segments.tdms";
+    let path = "tests/output/index_generated_multiple_segments.tdms";
+    std::fs::copy(fixture, path)?;
+
+    let source = OpenOptions::new()
+        .use_index_file(false)
+        .create_index_if_missing(false)
+        .open(path)?;
+    let channel = source.group("Group").unwrap().channel("Channel1").unwrap();
+    assert_eq!(channel.len(), 6);
+    drop(source);
+
+    drop(TdmsFile::open(path)?);
+    let indexed = OpenOptions::new().verify_index(true).open(path)?;
+    let channel = indexed.group("Group").unwrap().channel("Channel1").unwrap();
+    assert_eq!(channel.len(), 6);
+
+    remove_tdms(path);
+    Ok(())
+}
+
+#[test]
 fn open_without_recreation_does_not_write_index() -> Result<(), Box<dyn std::error::Error>> {
     create_dir()?;
     let path = "tests/output/index_no_recreate.tdms";
@@ -267,14 +291,14 @@ fn string_channel_roundtrip_via_index() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-fn force_old_index_mtime(path: &str) -> std::io::Result<()> {
+fn force_old_index_mtime(_path: &str) -> std::io::Result<()> {
     // Make the index definitively older than the data file. On unix a `touch`
     // with a fixed past date is deterministic; elsewhere fall back to a real
     // sleep, which separates the mtimes on coarse-granularity filesystems.
     #[cfg(unix)]
     {
         let _ = std::process::Command::new("touch")
-            .args(["-d", "2000-01-01", &format!("{}_index", path)])
+            .args(["-d", "2000-01-01", &format!("{}_index", _path)])
             .status();
     }
     #[cfg(not(unix))]
