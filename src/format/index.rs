@@ -78,6 +78,20 @@ pub fn write_object_metadata<'a, W: Write, P>(
 where
     P: Iterator<Item = (&'a String, &'a PropertyValue)>,
 {
+    write_object_metadata_with_raw_index(w, path, raw, NO_RAW_DATA_INDEX, prop_count, properties)
+}
+
+fn write_object_metadata_with_raw_index<'a, W: Write, P>(
+    w: &mut W,
+    path: &str,
+    raw: Option<(DataType, u64, Option<u64>)>,
+    empty_raw_index: u32,
+    prop_count: usize,
+    properties: P,
+) -> Result<u64>
+where
+    P: Iterator<Item = (&'a String, &'a PropertyValue)>,
+{
     let mut written = 0u64;
 
     w.write_u32(path.len() as u32)?;
@@ -102,7 +116,7 @@ where
             }
         }
         None => {
-            w.write_u32(NO_RAW_DATA_INDEX)?;
+            w.write_u32(empty_raw_index)?;
             written += 4;
         }
     }
@@ -216,10 +230,11 @@ pub fn write_segment_index<W: Write>(w: &mut W, segment: &Segment) -> Result<()>
                 .raw_data_meta
                 .as_ref()
                 .map(|m| (m.data_type, m.number_of_values, m.total_size_bytes));
-            write_object_metadata(
+            write_object_metadata_with_raw_index(
                 &mut metadata,
                 &obj.path.raw,
                 raw,
+                obj.raw_data_index,
                 obj.properties.len(),
                 obj.properties.iter(),
             )?;

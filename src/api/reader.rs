@@ -13,6 +13,19 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::Path;
 
+struct StringReadTask<'a> {
+    location: &'a DataLocation,
+    read_start: usize,
+    read_count: usize,
+}
+
+struct StringReadBlock {
+    read_start: usize,
+    read_count: usize,
+    offsets: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
 const LEAD_IN_LEN: u64 = 28;
 /// `next_segment_offset` value meaning the last segment is incomplete.
 const INCOMPLETE_SEGMENT_OFFSET: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -444,51 +457,23 @@ impl<'a> TdmsChannel<'a> {
             ));
         }
 
-        let file = File::open(&self.file.inner.path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut remaining = requested;
-        let mut current_idx = range.start;
+        let blocks = self.read_string_blocks(&range)?;
         let mut out_cursor = 0;
-
-        for loc in &self.data.data_locations {
-            let loc_count = loc.number_of_values as usize;
-            if current_idx >= loc_count {
-                current_idx -= loc_count;
-                continue;
-            }
-
-            let read_start = current_idx;
-            let read_count = loc_count.min(current_idx + remaining) - read_start;
-            if read_count == 0 {
-                break;
-            }
-
-            // String raw data is an array of N cumulative byte offsets followed by
-            // the concatenated UTF-8 strings.
-            let (offsets, bytes) =
-                self.read_string_block(&mut reader, loc, read_start, read_count)?;
-
-            let start_byte = offsets[read_start];
-            for (i, slot) in out[out_cursor..out_cursor + read_count]
+        for block in blocks {
+            let start_byte = block.offsets[block.read_start];
+            for (i, slot) in out[out_cursor..out_cursor + block.read_count]
                 .iter_mut()
                 .enumerate()
             {
-                let idx = read_start + i;
+                let idx = block.read_start + i;
                 let s = std::str::from_utf8(
-                    &bytes[offsets[idx] - start_byte..offsets[idx + 1] - start_byte],
+                    &block.bytes
+                        [block.offsets[idx] - start_byte..block.offsets[idx + 1] - start_byte],
                 )
                 .map_err(|_| TdmsError::StringEncoding)?;
                 *slot = s.to_string();
             }
-            out_cursor += read_count;
-
-            remaining -= read_count;
-            current_idx = 0;
-
-            if remaining == 0 {
-                break;
-            }
+            out_cursor += block.read_count;
         }
 
         Ok(requested)
@@ -534,49 +519,74 @@ impl<'a> TdmsChannel<'a> {
             return Ok(0);
         }
 
-        let file = File::open(&self.file.inner.path)?;
-        let mut reader = BufReader::new(file);
+        let blocks = self.read_string_blocks(&range)?;
 
-        let mut remaining = requested;
-        let mut current_idx = range.start;
-
-        for loc in &self.data.data_locations {
-            let loc_count = loc.number_of_values as usize;
-            if current_idx >= loc_count {
-                current_idx -= loc_count;
-                continue;
-            }
-
-            let read_start = current_idx;
-            let read_count = loc_count.min(current_idx + remaining) - read_start;
-            if read_count == 0 {
-                break;
-            }
-
-            // String raw data is an array of N cumulative byte offsets followed by
-            // the concatenated UTF-8 strings.
-            let (raw_offsets, bytes) =
-                self.read_string_block(&mut reader, loc, read_start, read_count)?;
-
-            let base = raw_offsets[read_start];
+        for block in blocks {
+            let base = block.offsets[block.read_start];
             let out_base = out_bytes.len();
             if out_offsets.is_empty() {
                 out_offsets.push(out_base as u64);
             }
-            for offset in &raw_offsets[read_start + 1..=read_start + read_count] {
+            for offset in &block.offsets[block.read_start + 1..=block.read_start + block.read_count]
+            {
                 out_offsets.push(out_base as u64 + *offset as u64 - base as u64);
             }
-            out_bytes.extend_from_slice(&bytes);
+            out_bytes.extend_from_slice(&block.bytes);
+        }
 
+        Ok(requested)
+    }
+
+    fn read_string_blocks(&self, range: &Range<usize>) -> Result<Vec<StringReadBlock>> {
+        let mut tasks = Vec::new();
+        let mut remaining = range.end - range.start;
+        let mut current_idx = range.start;
+
+        for location in &self.data.data_locations {
+            let location_count = location.number_of_values as usize;
+            if current_idx >= location_count {
+                current_idx -= location_count;
+                continue;
+            }
+
+            let read_start = current_idx;
+            let read_count = location_count.min(current_idx + remaining) - read_start;
+            if read_count == 0 {
+                break;
+            }
+            tasks.push(StringReadTask {
+                location,
+                read_start,
+                read_count,
+            });
             remaining -= read_count;
             current_idx = 0;
-
             if remaining == 0 {
                 break;
             }
         }
 
-        Ok(requested)
+        let file_len = std::fs::metadata(&self.file.inner.path)?.len();
+        let file = File::open(&self.file.inner.path)?;
+        let mut reader = BufReader::new(file);
+        tasks
+            .iter()
+            .map(|task| {
+                let (offsets, bytes) = self.read_string_block(
+                    &mut reader,
+                    task.location,
+                    task.read_start,
+                    task.read_count,
+                    file_len,
+                )?;
+                Ok(StringReadBlock {
+                    read_start: task.read_start,
+                    read_count: task.read_count,
+                    offsets,
+                    bytes,
+                })
+            })
+            .collect()
     }
 
     /// Read the string offset array for one data location and return only the
@@ -593,9 +603,9 @@ impl<'a> TdmsChannel<'a> {
         loc: &DataLocation,
         read_start: usize,
         read_count: usize,
+        file_len: u64,
     ) -> Result<(Vec<usize>, Vec<u8>)> {
         let loc_count = loc.number_of_values as usize;
-        let file_len = reader.get_ref().metadata()?.len();
 
         reader.seek(SeekFrom::Start(loc.offset))?;
         // A valid string block stores at least one 4-byte offset per value, so a
@@ -607,20 +617,26 @@ impl<'a> TdmsChannel<'a> {
                 "string channel value count exceeds file size".to_string(),
             ));
         }
+        let offsets_byte_len = loc_count
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| {
+                TdmsError::InvalidFormat("string channel offset table is too large".to_string())
+            })?;
+        let mut raw_offsets = vec![0; offsets_byte_len];
+        reader.read_exact(&mut raw_offsets)?;
+
         let mut offsets = Vec::with_capacity(loc_count + 1);
         offsets.push(0);
-        for _ in 0..loc_count {
-            offsets.push(reader.read_u32()? as usize);
-        }
-
         let mut prev = 0usize;
-        for &offset in &offsets[1..] {
+        for bytes in raw_offsets.chunks_exact(std::mem::size_of::<u32>()) {
+            let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
             if offset < prev {
                 return Err(TdmsError::InvalidFormat(
                     "string channel offsets must be monotonic non-decreasing".to_string(),
                 ));
             }
             prev = offset;
+            offsets.push(offset);
         }
 
         let block_len = prev;
@@ -634,7 +650,9 @@ impl<'a> TdmsChannel<'a> {
         let start_byte = offsets[read_start];
         let end_byte = offsets[read_start + read_count];
         let mut bytes = vec![0u8; end_byte - start_byte];
-        reader.seek(SeekFrom::Start(bytes_start + start_byte as u64))?;
+        if start_byte != 0 {
+            reader.seek(SeekFrom::Start(bytes_start + start_byte as u64))?;
+        }
         reader.read_exact(&mut bytes)?;
 
         Ok((offsets, bytes))
