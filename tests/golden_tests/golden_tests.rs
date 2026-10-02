@@ -25,6 +25,7 @@ fn read_channel_data_as_json(
     let range = 0..len;
 
     let json = match channel.dtype() {
+        DataType::Void => return Err("void channel has no readable sample data".into()),
         DataType::Double => {
             let mut data = vec![0.0f64; len];
             channel.read(range, &mut data)?;
@@ -356,6 +357,9 @@ fn run_test_case(tdms_path: &Path, mode: &str, open: &Opener) {
                         }
                         DataType::TimeStamp => {
                             // Explicitly not supported by the new API's typed decoding.
+                        }
+                        DataType::Void => {
+                            // Void channels contain no raw sample data.
                         }
                     }
                 }

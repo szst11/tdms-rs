@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
+    Void = 0,
     I8 = 1,
     I16 = 2,
     I32 = 3,
@@ -21,6 +22,7 @@ pub enum DataType {
 impl DataType {
     pub fn from_u32(val: u32) -> Result<Self> {
         match val {
+            0 => Ok(DataType::Void),
             1 => Ok(DataType::I8),
             2 => Ok(DataType::I16),
             3 => Ok(DataType::I32),
@@ -34,15 +36,13 @@ impl DataType {
             32 => Ok(DataType::String),
             33 => Ok(DataType::Boolean),
             68 => Ok(DataType::TimeStamp),
-            0 => Err(TdmsError::NotImplemented(
-                "Void DataType not supported in public API".to_string(),
-            )),
             _ => Err(TdmsError::NotImplemented(format!("DataType {}", val))),
         }
     }
 
     pub fn to_u32(&self) -> u32 {
         match self {
+            DataType::Void => 0,
             DataType::I8 => 1,
             DataType::I16 => 2,
             DataType::I32 => 3,
@@ -61,6 +61,7 @@ impl DataType {
 
     pub fn itemsize(&self) -> usize {
         match self {
+            DataType::Void => 0,
             DataType::I8 | DataType::U8 | DataType::Boolean => 1,
             DataType::I16 | DataType::U16 => 2,
             DataType::I32 | DataType::U32 | DataType::Float => 4,
