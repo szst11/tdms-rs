@@ -1,9 +1,16 @@
 //! Tests round-trip for all supported channel data types.
 //! TimeStamp channel data is intentionally excluded as it is not supported by the current typed API.
 
-use tdms_rs::{TdmsFile, TdmsWriter};
+use tdms_rs::{DataType, TdmsFile, TdmsWriter};
 
 use super::common::remove_tdms;
+
+#[test]
+fn void_data_type_is_preserved_as_metadata() {
+    assert_eq!(DataType::from_u32(0).unwrap(), DataType::Void);
+    assert_eq!(DataType::Void.to_u32(), 0);
+    assert_eq!(DataType::Void.itemsize(), 0);
+}
 
 macro_rules! test_channel_type {
     ($test_name:ident, $ty:ty, $data:expr) => {

@@ -877,6 +877,9 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                     let val =
                         crate::model::datatypes::DataType::from_u32(type_code).and_then(|dt| {
                             match dt {
+                                DataType::Void => Err(TdmsError::NotImplemented(
+                                    "Void properties are not supported".to_string(),
+                                )),
                                 DataType::I8 => Ok(PropertyValue::I8(self.reader.read_i8()?)),
                                 DataType::I16 => Ok(PropertyValue::I16(self.reader.read_i16()?)),
                                 DataType::I32 => Ok(PropertyValue::I32(self.reader.read_i32()?)),
