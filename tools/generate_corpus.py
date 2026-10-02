@@ -36,7 +36,7 @@ def generate_minimal():
     ensure_dir(folder)
     
     path = os.path.join(folder, "minimal.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         channel = ChannelObject("Group", "Channel1", [1.1, 2.2, 3.3])
         tdms_writer.write_segment([channel])
     logger.info(f"Generated {path}")
@@ -49,7 +49,7 @@ def generate_structure_variants():
 
     # 1. Multiple segments
     path = os.path.join(folder, "multiple_segments.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         # Segment 1
         curr_time = datetime.now(timezone.utc)
         root_obj = RootObject(properties={"description": "Segment 1"})
@@ -64,7 +64,7 @@ def generate_structure_variants():
 
     # 2. Empty segment (metadata only update, no new data)
     path = os.path.join(folder, "empty_segment.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         channel = ChannelObject("Group", "Channel1", [1, 2, 3])
         tdms_writer.write_segment([channel])
         
@@ -75,7 +75,7 @@ def generate_structure_variants():
 
     # 3. Metadata Only - No Data
     path = os.path.join(folder, "metadata_only.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         root_obj = RootObject(properties={"type": "metadata_only"})
         group_obj = GroupObject("Group1", properties={"desc": "An empty group"})
         # Channel with empty data
@@ -85,14 +85,14 @@ def generate_structure_variants():
 
     # 4. Root Only
     path = os.path.join(folder, "root_only.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         root_obj = RootObject(properties={"title": "Root Only File"})
         tdms_writer.write_segment([root_obj])
     logger.info(f"Generated {path}")
     
     # 5. Group Only
     path = os.path.join(folder, "group_only.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         group_obj = GroupObject("GroupOnly", properties={"desc": "No channels here"})
         tdms_writer.write_segment([group_obj])
     logger.info(f"Generated {path}")
@@ -105,7 +105,7 @@ def generate_datatypes():
 
     # 1. Integers
     path = os.path.join(folder, "integers.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         data_int8 = np.array([-128, -1, 0, 1, 127], dtype=np.int8)
         data_int16 = np.array([-32768, -1, 0, 1, 32767], dtype=np.int16)
         data_int32 = np.array([-2147483648, -1, 0, 1, 2147483647], dtype=np.int32)
@@ -131,7 +131,7 @@ def generate_datatypes():
 
     # 2. Floats
     path = os.path.join(folder, "floats.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         data_float32 = np.array([0.0, -1.0, 1.0, 3.14159, 1.23e-10], dtype=np.float32)
         data_float64 = np.array([0.0, -1.0, 1.0, 3.1415926535, 1.23e-20], dtype=np.float64)
         
@@ -144,7 +144,7 @@ def generate_datatypes():
     
     # 3. Booleans
     path = os.path.join(folder, "booleans.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         data_bool = [True, False, True, True, False, False]
         channel = ChannelObject("Booleans", "Flags", data_bool)
         tdms_writer.write_segment([channel])
@@ -152,7 +152,7 @@ def generate_datatypes():
 
     # 4. Strings
     path = os.path.join(folder, "strings.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         # Note: nptdms might treat simple lists of strings as ... strings.
         data_str = ["Hello", "World", "", "TDMS", "File Format"]
         channel = ChannelObject("Strings", "Basic", data_str)
@@ -161,7 +161,7 @@ def generate_datatypes():
 
     # 5. Timestamps (Basic)
     path = os.path.join(folder, "timestamps.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         now = datetime.now(timezone.utc)
         data_time = [
             now,
@@ -181,7 +181,7 @@ def generate_numeric_limits():
 
     # 1. Special Floats
     path = os.path.join(folder, "special_floats.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         data_float = np.array([np.inf, -np.inf, np.nan, -0.0, 0.0], dtype=np.float64)
         channel = ChannelObject("Limits", "SpecialFloats", data_float)
         tdms_writer.write_segment([channel])
@@ -194,7 +194,7 @@ def generate_string_edge_cases():
     ensure_dir(folder)
 
     path = os.path.join(folder, "edge_cases.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         long_string = "A" * 10000
         null_byte_string = "Null\x00Byte"
         unicode_string = "Hello \u00A9 \U0001F600"
@@ -212,7 +212,7 @@ def generate_properties():
 
     # 1. All Levels
     path = os.path.join(folder, "all_levels.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         root_props = {
             "author": "Antigravity",
             "version": 1.0,
@@ -232,7 +232,7 @@ def generate_properties():
 
     # 2. Key Types
     path = os.path.join(folder, "property_keys.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         props = {
             "standard": "value",
             "with spaces": "value",
@@ -251,7 +251,7 @@ def generate_timestamps_advanced():
     ensure_dir(folder)
     
     path = os.path.join(folder, "high_precision.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         t0 = datetime.now(timezone.utc)
         data = [
             t0,
@@ -264,7 +264,7 @@ def generate_timestamps_advanced():
     logger.info(f"Generated {path}")
 
     path = os.path.join(folder, "extreme_range.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         t_epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
         t_past = datetime(1800, 1, 1, tzinfo=timezone.utc) 
         t_future = datetime(3000, 1, 1, tzinfo=timezone.utc)
@@ -281,7 +281,7 @@ def generate_raw_variants():
     ensure_dir(folder)
     
     path = os.path.join(folder, "standard_layout.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         c1 = ChannelObject("Group", "C1", np.arange(100, dtype=np.int32))
         c2 = ChannelObject("Group", "C2", np.arange(100, dtype=np.int32))
         tdms_writer.write_segment([c1, c2])
@@ -294,7 +294,7 @@ def generate_scaling():
     ensure_dir(folder)
     
     path = os.path.join(folder, "linear_scaling.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         props = {
             "wf_start_offset": 10.0,
             "wf_increment": 0.5,
@@ -314,7 +314,7 @@ def generate_large_sparse():
     ensure_dir(folder)
     
     path = os.path.join(folder, "sparse.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         size = 100000 
         data = np.zeros(size, dtype=np.float32)
         data[0] = 1.0
@@ -331,12 +331,12 @@ def generate_incremental():
     
     path = os.path.join(folder, "append_mode.tdms")
     # First write
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         channel = ChannelObject("Group", "Channel1", [1, 2, 3])
         tdms_writer.write_segment([channel])
     
     # Append
-    with TdmsWriter(path, mode='a') as tdms_writer:
+    with TdmsWriter(path, mode='a', index_file=True) as tdms_writer:
         channel = ChannelObject("Group", "Channel1", [4, 5, 6])
         tdms_writer.write_segment([channel])
         
@@ -349,7 +349,7 @@ def generate_metadata_variants():
     ensure_dir(folder)
     
     path = os.path.join(folder, "no_data.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         # Same as structure variant but in specific folder
         root_obj = RootObject(properties={"type": "metadata_only"})
         channel_obj = ChannelObject("Group1", "Channel1", [])
@@ -363,7 +363,7 @@ def generate_unicode_paths():
     ensure_dir(folder)
     
     path = os.path.join(folder, "unicode_paths.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         # Unicode in Group and Channel names
         group_name = "Gr\u00F6up_\u03A9" # Group_Omega
         channel_name = "Ch\u00E5nnel_\u2126" # Channel_Ohm
@@ -380,7 +380,7 @@ def generate_alignment():
     ensure_dir(folder)
     
     path = os.path.join(folder, "odd_sizes.tdms")
-    with TdmsWriter(path) as tdms_writer:
+    with TdmsWriter(path, index_file=True) as tdms_writer:
         # Writing odd number of bytes might test padding logic in parser
         # Boolean is 1 byte. 
         data = [True, False, True] # 3 bytes

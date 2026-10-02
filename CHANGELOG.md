@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Companion index files (`.tdms_index`)**: reading now uses a sibling
+  `<file>.tdms_index` to build the group/channel/property index (`TDSh` tag),
+  per the `nptdms` layout; the `.tdms` file is opened lazily only for channel
+  data.
+  - `OpenOptions` for reader customization: `use_index_file`,
+    `create_index_if_missing`, and `verify_index`.
+  - `TdmsWriterOptions` (with `write_index_file`) to emit a `.tdms_index`
+    companion file when writing.
+  - `TdmsError::IndexMismatch` for failing verification.
+  - A stale, empty, or corrupt index is skipped in favor of the data file;
+    regeneration on open is best-effort, so read-only directories keep working.
+- **Fixtures**: the golden corpus now ships `.tdms_index` companions for every
+  `.tdms` file, and the golden test runs each fixture through both the index and
+  data-file parsing paths.
+
+### Changed
+- Python tooling now uses `uv` instead of `pip`/`requirements.txt` alone;
+  corpus generation writes index files (see `tools/README.md` and `AGENTS.md`).
+
 ## [2.0.0] - 2026-01-16
 
 ### Changed

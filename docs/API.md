@@ -19,6 +19,33 @@ channel.read(0..channel.len(), &mut data)?;
 // File is automatically closed when 'file' goes out of scope
 ```
 
+#### Companion Index Files (`.tdms_index`)
+When a sibling `<file>.tdms_index` exists (as written by NI tools, `nptdms`,
+or `TdmsWriterOptions::write_index_file`), `TdmsFile::open` uses it to build the
+group/channel/property index quickly without scanning the data file. Raw channel
+data is still read lazily from the `.tdms` file when requested.
+
+An index is only trusted when it is non-empty and not older than the data file;
+a missing, empty, stale, or truncated/corrupt index is skipped in favor of
+parsing the data file, and the index is regenerated so future opens are fast.
+Regeneration is best-effort, so opening a file (or a file in a read-only
+directory) never fails because an index could not be written.
+
+Tune this behavior with `OpenOptions`:
+
+```rust,no_run
+use tdms_rs::OpenOptions;
+
+// Never use an index (always read metadata from the data file).
+let file = OpenOptions::new().use_index_file(false).open("data.tdms")?;
+
+// Do not generate an index when none exists.
+let file = OpenOptions::new().create_index_if_missing(false).open("data.tdms")?;
+
+// Verify the index matches the data file by parsing both.
+let file = OpenOptions::new().verify_index(true).open("data.tdms")?;
+```
+
 ### Writing Files
 Writing uses a builder-like pattern through `TdmsWriter` with RAII-based lifecycle.
 
@@ -32,6 +59,19 @@ Writing uses a builder-like pattern through `TdmsWriter` with RAII-based lifecyc
     // Optional: explicitly flush to ensure data is written
     writer.flush()?; 
     // File is automatically flushed and closed when writer goes out of scope
+}
+```
+
+To also write a `<file>.tdms_index` companion file, use `TdmsWriterOptions`:
+
+```rust,no_run
+use tdms_rs::TdmsWriterOptions;
+
+{
+    let writer = TdmsWriterOptions::new()
+        .write_index_file(true)
+        .create("output.tdms")?;
+    // File (and its .tdms_index companion) is written when the writer drops
 }
 ```
 

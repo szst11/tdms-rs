@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use tdms_rs::{DataType, TdmsFile};
+use tdms_rs::{DataType, OpenOptions, TdmsFile};
 
 fn read_channel_data_as_json(
     channel: &tdms_rs::TdmsChannel,
@@ -25,6 +25,7 @@ fn read_channel_data_as_json(
     let range = 0..len;
 
     let json = match channel.dtype() {
+        DataType::Void => return Err("void channel has no readable sample data".into()),
         DataType::Double => {
             let mut data = vec![0.0f64; len];
             channel.read(range, &mut data)?;
@@ -118,6 +119,8 @@ struct GoldenChannel {
     properties: HashMap<String, serde_json::Value>,
 }
 
+type Opener = dyn Fn(&Path) -> tdms_rs::Result<TdmsFile>;
+
 #[test]
 fn test_corpus() {
     let corpus_dir = Path::new("tests/fixtures/tdms_corpus");
@@ -129,24 +132,36 @@ fn test_corpus() {
         return;
     }
 
-    let mut visited = 0;
-    let mut passed = 0;
+    // Run every fixture twice: once through the `.tdms_index` companion file
+    // (the default fast path) and once straight from the `.tdms` data file, so
+    // both parsing paths stay covered by the corpus.
+    let openers: &[(&str, &Opener)] = &[
+        ("index", &|p| TdmsFile::open(p)),
+        ("data-file", &|p| {
+            OpenOptions::new().use_index_file(false).open(p)
+        }),
+    ];
 
-    visit_dirs(corpus_dir, &mut |entry| {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("tdms") {
-            visited += 1;
-            run_test_case(&path);
-            passed += 1;
-        }
-    })
-    .unwrap();
+    for (mode, open) in openers {
+        let mut visited = 0;
+        let mut passed = 0;
 
-    println!(
-        "\n>>> Golden Corpus Test Result: Passed {}/{} files.",
-        passed, visited
-    );
-    assert!(visited > 0, "No TDMS files found in corpus!");
+        visit_dirs(corpus_dir, &mut |entry| {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("tdms") {
+                visited += 1;
+                run_test_case(&path, mode, open);
+                passed += 1;
+            }
+        })
+        .unwrap();
+
+        println!(
+            "\n>>> Golden Corpus Test Result ({}): Passed {}/{} files.",
+            mode, passed, visited
+        );
+        assert!(visited > 0, "No TDMS files found in corpus!");
+    }
 }
 
 fn visit_dirs(dir: &Path, cb: &mut dyn FnMut(&fs::DirEntry)) -> std::io::Result<()> {
@@ -164,15 +179,15 @@ fn visit_dirs(dir: &Path, cb: &mut dyn FnMut(&fs::DirEntry)) -> std::io::Result<
     Ok(())
 }
 
-fn run_test_case(tdms_path: &Path) {
+fn run_test_case(tdms_path: &Path, mode: &str, open: &Opener) {
     let json_path = tdms_path.with_extension("json");
     assert!(json_path.exists(), "Missing JSON for {:?}", tdms_path);
 
-    println!("Testing {:?}", tdms_path);
+    println!("Testing ({}) {:?}", mode, tdms_path);
 
     // Load Rust Parser output
     // This is expected to fail or panic until implemented
-    let tdms_file = match TdmsFile::open(tdms_path) {
+    let tdms_file = match open(tdms_path) {
         Ok(f) => f,
         Err(e) => {
             // Allow failure for now by printing error, but eventually we want strict assertions
@@ -342,6 +357,9 @@ fn run_test_case(tdms_path: &Path) {
                         }
                         DataType::TimeStamp => {
                             // Explicitly not supported by the new API's typed decoding.
+                        }
+                        DataType::Void => {
+                            // Void channels contain no raw sample data.
                         }
                     }
                 }
