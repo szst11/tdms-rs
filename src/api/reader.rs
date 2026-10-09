@@ -1,8 +1,8 @@
 use crate::error::{Result, TdmsError};
-use crate::format::index::{index_path_for, raw_data_size, write_index_file};
+use crate::format::index::{index_path_for, raw_data_size, write_index_file, TOC_BIG_ENDIAN};
 use crate::format::metadata::ParsingMetadata;
 use crate::format::segment::Segment;
-use crate::io::ext::TdmsReadExt;
+use crate::io::ext::{TdmsEndian, TdmsReadExt};
 use crate::model::channel::{DataLocation, TdmsChannelData};
 use crate::model::datatypes::{DataType, PropertyValue};
 use crate::model::file::TdmsFileInner;
@@ -173,7 +173,12 @@ impl OpenOptions {
         let (segments, _) = Self::parse_segments_from_path(path, false)?;
         let inner = Self::build_inner(path, &segments);
 
-        if self.use_index_file && self.create_index_if_missing {
+        if self.use_index_file
+            && self.create_index_if_missing
+            && !segments
+                .iter()
+                .any(|segment| segment._toc_mask & TOC_BIG_ENDIAN != 0)
+        {
             // The index is an optimization only: a write failure here (e.g.
             // a read-only directory) must not fail an otherwise-readable
             // open, so generation is best-effort.
@@ -272,6 +277,7 @@ impl OpenOptions {
                             channel.data_locations.push(DataLocation {
                                 offset: loc.offset,
                                 number_of_values: loc.number_of_values,
+                                big_endian: loc.big_endian,
                             });
                         }
 
@@ -629,7 +635,11 @@ impl<'a> TdmsChannel<'a> {
         offsets.push(0);
         let mut prev = 0usize;
         for bytes in raw_offsets.chunks_exact(std::mem::size_of::<u32>()) {
-            let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            let offset = if loc.big_endian {
+                u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            } else {
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            } as usize;
             if offset < prev {
                 return Err(TdmsError::InvalidFormat(
                     "string channel offsets must be monotonic non-decreasing".to_string(),
@@ -697,6 +707,11 @@ impl<'a> TdmsChannel<'a> {
 
             let read_bytes = read_count * itemsize;
             reader.read_exact(&mut out[out_cursor..out_cursor + read_bytes])?;
+            if loc.big_endian {
+                for value in out[out_cursor..out_cursor + read_bytes].chunks_exact_mut(itemsize) {
+                    value.reverse();
+                }
+            }
             out_cursor += read_bytes;
 
             remaining -= read_count;
@@ -791,31 +806,36 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
 
         let mut lead = &lead_in[4..];
         let mask_val = lead.read_u32()?;
-        let version = lead.read_u32()?;
-        let next_segment_offset = lead.read_u64()?;
-        let raw_data_offset = lead.read_u64()?;
+        let endian = if mask_val & (1 << 6) != 0 {
+            TdmsEndian::Big
+        } else {
+            TdmsEndian::Little
+        };
+        let version = lead.read_u32_endian(endian)?;
+        let next_segment_offset = lead.read_u64_endian(endian)?;
+        let raw_data_offset = lead.read_u64_endian(endian)?;
 
         let mask = crate::format::segment::Mask::new(mask_val);
         let mut objects = Vec::new();
 
         if mask.has_new_obj_list() {
-            let count = self.reader.read_u32()?;
+            let count = self.reader.read_u32_endian(endian)?;
             self.object_order.clear();
 
             for _ in 0..count {
-                let path_len = self.reader.read_u32()?;
+                let path_len = self.reader.read_u32_endian(endian)?;
                 let mut path_bytes = vec![0u8; path_len as usize];
                 self.reader.read_exact(&mut path_bytes)?;
                 let path_str =
                     String::from_utf8(path_bytes).map_err(|_| TdmsError::StringEncoding)?;
                 self.object_order.push(path_str.clone());
 
-                let raw_data_index = self.reader.read_u32()?;
+                let raw_data_index = self.reader.read_u32_endian(endian)?;
                 let mut raw_data_meta = None;
                 let prop_count;
 
                 if raw_data_index != 0 && raw_data_index != 0xFFFFFFFF {
-                    let type_code = self.reader.read_u32()?;
+                    let type_code = self.reader.read_u32_endian(endian)?;
                     let data_type = DataType::from_u32(type_code)?;
 
                     let mut count = 0;
@@ -827,10 +847,10 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                         // data including the per-value offset array (8). Some writers
                         // under-report the index length in the header, so read the
                         // fixed-size index from the stream instead of using it.
-                        self.reader.read_u32()?; // dimension (must be 1)
-                        count = self.reader.read_u64()?;
-                        total_size = Some(self.reader.read_u64()?);
-                        prop_count = self.reader.read_u32()?;
+                        self.reader.read_u32_endian(endian)?; // dimension (must be 1)
+                        count = self.reader.read_u64_endian(endian)?;
+                        total_size = Some(self.reader.read_u64_endian(endian)?);
+                        prop_count = self.reader.read_u32_endian(endian)?;
                         raw_data_meta = Some(crate::format::metadata::RawDataMeta {
                             data_type,
                             number_of_values: count,
@@ -845,11 +865,11 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
 
                         if skipped.len() >= 12 {
                             let mut count_slice = &skipped[4..12];
-                            count = count_slice.read_u64()?;
+                            count = count_slice.read_u64_endian(endian)?;
                         }
                         let start = skipped.len().saturating_sub(4);
                         let mut end_slice = &skipped[start..];
-                        prop_count = end_slice.read_u32()?;
+                        prop_count = end_slice.read_u32_endian(endian)?;
 
                         raw_data_meta = Some(crate::format::metadata::RawDataMeta {
                             data_type,
@@ -863,17 +883,17 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                         )));
                     }
                 } else {
-                    prop_count = self.reader.read_u32()?;
+                    prop_count = self.reader.read_u32_endian(endian)?;
                 }
 
                 let mut properties = std::collections::HashMap::new();
                 for _ in 0..prop_count {
-                    let key_len = self.reader.read_u32()?;
+                    let key_len = self.reader.read_u32_endian(endian)?;
                     let mut key_bytes = vec![0u8; key_len as usize];
                     self.reader.read_exact(&mut key_bytes)?;
                     let key =
                         String::from_utf8(key_bytes).map_err(|_| TdmsError::StringEncoding)?;
-                    let type_code = self.reader.read_u32()?;
+                    let type_code = self.reader.read_u32_endian(endian)?;
                     let val =
                         crate::model::datatypes::DataType::from_u32(type_code).and_then(|dt| {
                             match dt {
@@ -881,24 +901,36 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                                     "Void properties are not supported".to_string(),
                                 )),
                                 DataType::I8 => Ok(PropertyValue::I8(self.reader.read_i8()?)),
-                                DataType::I16 => Ok(PropertyValue::I16(self.reader.read_i16()?)),
-                                DataType::I32 => Ok(PropertyValue::I32(self.reader.read_i32()?)),
-                                DataType::I64 => Ok(PropertyValue::I64(self.reader.read_i64()?)),
+                                DataType::I16 => {
+                                    Ok(PropertyValue::I16(self.reader.read_i16_endian(endian)?))
+                                }
+                                DataType::I32 => {
+                                    Ok(PropertyValue::I32(self.reader.read_i32_endian(endian)?))
+                                }
+                                DataType::I64 => {
+                                    Ok(PropertyValue::I64(self.reader.read_i64_endian(endian)?))
+                                }
                                 DataType::U8 => Ok(PropertyValue::U8(self.reader.read_u8()?)),
-                                DataType::U16 => Ok(PropertyValue::U16(self.reader.read_u16()?)),
-                                DataType::U32 => Ok(PropertyValue::U32(self.reader.read_u32()?)),
-                                DataType::U64 => Ok(PropertyValue::U64(self.reader.read_u64()?)),
+                                DataType::U16 => {
+                                    Ok(PropertyValue::U16(self.reader.read_u16_endian(endian)?))
+                                }
+                                DataType::U32 => {
+                                    Ok(PropertyValue::U32(self.reader.read_u32_endian(endian)?))
+                                }
+                                DataType::U64 => {
+                                    Ok(PropertyValue::U64(self.reader.read_u64_endian(endian)?))
+                                }
                                 DataType::Float => {
-                                    Ok(PropertyValue::Float(self.reader.read_f32()?))
+                                    Ok(PropertyValue::Float(self.reader.read_f32_endian(endian)?))
                                 }
                                 DataType::Double => {
-                                    Ok(PropertyValue::Double(self.reader.read_f64()?))
+                                    Ok(PropertyValue::Double(self.reader.read_f64_endian(endian)?))
                                 }
                                 DataType::Boolean => {
                                     Ok(PropertyValue::Boolean(self.reader.read_u8()? != 0))
                                 }
                                 DataType::String => {
-                                    let len = self.reader.read_u32()?;
+                                    let len = self.reader.read_u32_endian(endian)?;
                                     let mut buf = vec![0u8; len as usize];
                                     self.reader.read_exact(&mut buf)?;
                                     let s = String::from_utf8(buf)
@@ -906,8 +938,8 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                                     Ok(PropertyValue::String(s))
                                 }
                                 DataType::TimeStamp => {
-                                    let fraction = self.reader.read_u64()?;
-                                    let seconds = self.reader.read_i64()?;
+                                    let fraction = self.reader.read_u64_endian(endian)?;
+                                    let seconds = self.reader.read_i64_endian(endian)?;
                                     Ok(PropertyValue::TimeStamp((seconds, fraction)))
                                 }
                             }
@@ -947,6 +979,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                     obj.data_location = Some(crate::format::metadata::DataLocation {
                         offset: current_raw_offset,
                         number_of_values: meta.number_of_values,
+                        big_endian: matches!(endian, TdmsEndian::Big),
                         _data_type: meta.data_type,
                         _total_size_bytes: meta.total_size_bytes,
                     });
@@ -959,6 +992,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                         obj.data_location = Some(crate::format::metadata::DataLocation {
                             offset: current_raw_offset,
                             number_of_values: meta.number_of_values,
+                            big_endian: matches!(endian, TdmsEndian::Big),
                             _data_type: meta.data_type,
                             _total_size_bytes: meta.total_size_bytes,
                         });
