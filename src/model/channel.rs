@@ -14,4 +14,5 @@ pub struct TdmsChannelData {
 pub struct DataLocation {
     pub offset: u64,
     pub number_of_values: u64,
+    pub big_endian: bool,
 }

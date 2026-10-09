@@ -29,6 +29,8 @@ pub const DATA_TAG: [u8; 4] = *b"TDSm";
 pub const INDEX_TAG: [u8; 4] = *b"TDSh";
 /// Bit in the ToC mask indicating the segment carries a new object list.
 pub const TOC_NEW_OBJ_LIST: u32 = 1 << 2;
+/// Bit in the ToC mask indicating that segment fields and metadata are big-endian.
+pub const TOC_BIG_ENDIAN: u32 = 1 << 6;
 /// `raw_data_index` value meaning "no raw data in this segment".
 pub const NO_RAW_DATA_INDEX: u32 = 0xFFFF_FFFF;
 

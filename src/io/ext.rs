@@ -1,6 +1,12 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
+#[derive(Clone, Copy)]
+pub enum TdmsEndian {
+    Little,
+    Big,
+}
+
 pub trait TdmsReadExt: Read {
     fn read_u8(&mut self) -> std::io::Result<u8> {
         ReadBytesExt::read_u8(self)
@@ -40,6 +46,62 @@ pub trait TdmsReadExt: Read {
 
     fn read_f64(&mut self) -> std::io::Result<f64> {
         ReadBytesExt::read_f64::<LittleEndian>(self)
+    }
+
+    fn read_u32_endian(&mut self, endian: TdmsEndian) -> std::io::Result<u32> {
+        match endian {
+            TdmsEndian::Little => self.read_u32(),
+            TdmsEndian::Big => ReadBytesExt::read_u32::<byteorder::BigEndian>(self),
+        }
+    }
+
+    fn read_u16_endian(&mut self, endian: TdmsEndian) -> std::io::Result<u16> {
+        match endian {
+            TdmsEndian::Little => self.read_u16(),
+            TdmsEndian::Big => ReadBytesExt::read_u16::<byteorder::BigEndian>(self),
+        }
+    }
+
+    fn read_u64_endian(&mut self, endian: TdmsEndian) -> std::io::Result<u64> {
+        match endian {
+            TdmsEndian::Little => self.read_u64(),
+            TdmsEndian::Big => ReadBytesExt::read_u64::<byteorder::BigEndian>(self),
+        }
+    }
+
+    fn read_i16_endian(&mut self, endian: TdmsEndian) -> std::io::Result<i16> {
+        match endian {
+            TdmsEndian::Little => self.read_i16(),
+            TdmsEndian::Big => ReadBytesExt::read_i16::<byteorder::BigEndian>(self),
+        }
+    }
+
+    fn read_i32_endian(&mut self, endian: TdmsEndian) -> std::io::Result<i32> {
+        match endian {
+            TdmsEndian::Little => self.read_i32(),
+            TdmsEndian::Big => ReadBytesExt::read_i32::<byteorder::BigEndian>(self),
+        }
+    }
+
+    fn read_i64_endian(&mut self, endian: TdmsEndian) -> std::io::Result<i64> {
+        match endian {
+            TdmsEndian::Little => self.read_i64(),
+            TdmsEndian::Big => ReadBytesExt::read_i64::<byteorder::BigEndian>(self),
+        }
+    }
+
+    fn read_f32_endian(&mut self, endian: TdmsEndian) -> std::io::Result<f32> {
+        match endian {
+            TdmsEndian::Little => self.read_f32(),
+            TdmsEndian::Big => ReadBytesExt::read_f32::<byteorder::BigEndian>(self),
+        }
+    }
+
+    fn read_f64_endian(&mut self, endian: TdmsEndian) -> std::io::Result<f64> {
+        match endian {
+            TdmsEndian::Little => self.read_f64(),
+            TdmsEndian::Big => ReadBytesExt::read_f64::<byteorder::BigEndian>(self),
+        }
     }
 }
 
