@@ -268,7 +268,8 @@ pub fn write_index_file<P: AsRef<Path>>(index_path: P, segments: &[Segment]) -> 
     let index_path = index_path.as_ref();
     let temp_path = index_path.with_extension("tdms_index.tmp");
     let file = File::create(&temp_path)?;
-    let mut writer = BufWriter::new(file);
+    // Small metadata writes are expensive on remote/high-latency filesystems.
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
     for segment in segments {
         write_segment_index(&mut writer, segment)?;
     }

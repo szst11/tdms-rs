@@ -11,6 +11,14 @@ The reader uses an indexed approach. When a file is opened:
 - **Metadata**: Loaded eagerly to provide fast navigation.
 - **Raw Data**: Loaded lazily when `read()` is called, using file seeking and direct reads into user-provided buffers to minimize memory overhead.
 
+Metadata parsing wraps its buffered stream in `PositionedReader`. Logical
+offsets are updated from successful read counts rather than querying the file
+position for every segment. Nearby absolute skips are translated to
+`BufReader::seek_relative`, preserving unread buffer contents when possible;
+skips beyond the buffer still seek the underlying stream. This applies to
+both data-file metadata scans and companion-index scans, without changing
+channel data locations or the on-disk format.
+
 ### Companion Index Files (`.tdms_index`)
 When a sibling `<file>.tdms_index` exists (see `src/format/index.rs`), the reader
 prefers it for building the metadata index. The index file stores the same
@@ -38,6 +46,12 @@ Key points:
 - Regeneration writes to a temp file and atomically renames it into place, so a
   concurrent reader sees either the old index or a complete new one, never a
   partially-written index.
+- Index regeneration batches serialized segments through a bounded 4 MiB
+  write buffer instead of the standard 8 KiB default. This reduces small-write
+  overhead on high-latency filesystems without changing the index format or
+  retaining arbitrarily large serialized indexes in memory. Indexes smaller
+  than the buffer are emitted in one final write. The final partial buffer
+  is explicitly flushed before the temporary file is renamed.
 - Index generation on open is best-effort: a write failure (e.g. read-only
   directory) never fails the open, so `open()` stays safe for read-only inputs.
 - Index usage can be toggled (`OpenOptions::use_index_file`), generation can be

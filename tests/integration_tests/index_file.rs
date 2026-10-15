@@ -144,6 +144,106 @@ fn generated_index_preserves_multiple_segment_metadata() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn generated_index_flushes_large_metadata_and_final_tail() -> Result<(), Box<dyn std::error::Error>>
+{
+    use tdms_rs::PropertyValue;
+
+    create_dir()?;
+    let path = "tests/output/index_large_metadata.tdms";
+    let payload = "metadata".repeat(160 * 1024);
+    {
+        let mut writer = TdmsWriter::create(path)?;
+        for index in 0..4 {
+            writer.add_property(
+                format!("property_{index}"),
+                PropertyValue::String(payload.clone()),
+            )?;
+        }
+        writer.add_property("final_property", "last bytes must be flushed".into())?;
+        let mut group = writer.add_group("G")?;
+        group.add_channel::<i32>("C")?.write(&[7, -8, 9])?;
+    }
+    let index_path = format!("{path}_index");
+    let baseline = std::fs::read(path)?;
+    assert!(!std::path::Path::new(&index_path).exists());
+    drop(TdmsFile::open(path)?);
+    let index_size = std::fs::metadata(&index_path)?.len();
+    assert!(index_size > 4 * 1024 * 1024);
+    assert_ne!(index_size % (4 * 1024 * 1024), 0);
+    assert!(!std::path::Path::new(&format!("{index_path}.tmp")).exists());
+    let indexed = OpenOptions::new()
+        .create_index_if_missing(false)
+        .verify_index(true)
+        .open(path)?;
+    for index in 0..4 {
+        assert_eq!(
+            indexed.property(&format!("property_{index}")),
+            Some(&PropertyValue::String(payload.clone())),
+        );
+    }
+    assert_eq!(
+        indexed.property("final_property"),
+        Some(&PropertyValue::String("last bytes must be flushed".into())),
+    );
+    let mut values = [0; 3];
+    indexed
+        .group("G")
+        .unwrap()
+        .channel("C")
+        .unwrap()
+        .read(0..3, &mut values)?;
+    assert_eq!(values, [7, -8, 9]);
+    assert_eq!(std::fs::read(path)?, baseline);
+    remove_tdms(path);
+    Ok(())
+}
+
+#[test]
+fn generated_index_flushes_many_small_segments() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use tdms_rs::PropertyValue;
+
+    create_dir()?;
+    let path = "tests/output/index_many_small_segments.tdms";
+    {
+        let mut writer = TdmsWriter::create(path)?;
+        writer.add_property(
+            "description",
+            PropertyValue::String("metadata".repeat(1024)),
+        )?;
+        writer
+            .add_group("G")?
+            .add_channel::<i32>("C")?
+            .write(&[7, -8, 9])?;
+    }
+    let segment = std::fs::read(path)?;
+    let segments = 600;
+    {
+        let mut data = std::fs::File::create(path)?;
+        for _ in 0..segments {
+            data.write_all(&segment)?;
+        }
+    }
+    drop(TdmsFile::open(path)?);
+    let index_path = format!("{path}_index");
+    let index_size = std::fs::metadata(&index_path)?.len();
+    assert!(index_size > 4 * 1024 * 1024);
+    assert_ne!(index_size % (4 * 1024 * 1024), 0);
+    assert!(!std::path::Path::new(&format!("{index_path}.tmp")).exists());
+    let file = OpenOptions::new()
+        .create_index_if_missing(false)
+        .verify_index(true)
+        .open(path)?;
+    let channel = file.group("G").unwrap().channel("C").unwrap();
+    assert_eq!(channel.len(), segments * 3);
+    let mut values = [0; 6];
+    channel.read(segments * 3 - 6..segments * 3, &mut values)?;
+    assert_eq!(values, [7, -8, 9, 7, -8, 9]);
+    remove_tdms(path);
+    Ok(())
+}
+
+#[test]
 fn open_without_recreation_does_not_write_index() -> Result<(), Box<dyn std::error::Error>> {
     create_dir()?;
     let path = "tests/output/index_no_recreate.tdms";

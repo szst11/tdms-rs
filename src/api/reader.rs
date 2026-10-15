@@ -3,6 +3,7 @@ use crate::format::index::{index_path_for, raw_data_size, write_index_file, TOC_
 use crate::format::metadata::ParsingMetadata;
 use crate::format::segment::Segment;
 use crate::io::ext::{TdmsEndian, TdmsReadExt};
+use crate::io::positioned::PositionedReader;
 use crate::model::channel::{DataLocation, TdmsChannelData};
 use crate::model::datatypes::{DataType, PropertyValue};
 use crate::model::file::TdmsFileInner;
@@ -219,7 +220,7 @@ impl OpenOptions {
 
     fn parse_segments_from_path(path: &Path, is_index_file: bool) -> Result<(Vec<Segment>, u64)> {
         let file = File::open(path)?;
-        let mut reader = TdmsReaderInternal::new(BufReader::new(file), is_index_file);
+        let mut reader = TdmsReaderInternal::new(PositionedReader::new(file), is_index_file);
         let mut segments = Vec::new();
 
         loop {
@@ -1035,8 +1036,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             current_raw_offset
         };
 
-        let current_pos = self.reader.stream_position()?;
-        if current_pos != target_pos {
+        if metadata_end != target_pos {
             self.reader.seek(SeekFrom::Start(target_pos))?;
         }
 
