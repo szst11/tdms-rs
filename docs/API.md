@@ -106,3 +106,17 @@ Minimize allocations by reading into a pre-allocated buffer:
 let mut buffer = vec![0.0f64; 1000];
 channel.read(0..1000, &mut buffer)?;
 ```
+
+### Indexed Raw-Data Locations
+
+`TdmsChannel::data_locations()` returns a borrowed `&[DataLocation]` from the
+already-built metadata index, in channel sample order. It does not open or read
+the data file and works identically for indexes parsed from `.tdms` and
+`.tdms_index`. `DataLocation` is re-exported at the crate root and contains the
+data-file `offset`, `number_of_values`, and on-disk `big_endian` flag.
+
+For fixed-width channels each location describes contiguous samples, allowing
+downstream readers to coalesce ranges across channels. Callers must validate
+sample ranges, account for each fragment's byte order, and handle I/O errors.
+String locations instead point to an offset table followed by UTF-8 payload;
+use `read_string_buffers()` rather than treating them as fixed-width samples.

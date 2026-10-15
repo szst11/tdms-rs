@@ -394,6 +394,16 @@ impl<'a> TdmsChannel<'a> {
         self.data.len == 0
     }
 
+    /// Return indexed raw-data locations in channel sample order.
+    ///
+    /// This borrows the existing metadata index without opening the data file.
+    /// For fixed-width channels, each location contains contiguous samples;
+    /// `big_endian` describes the on-disk byte order. String locations point to
+    /// an offset table followed by UTF-8 data, not fixed-width sample bytes.
+    pub fn data_locations(&self) -> &[DataLocation] {
+        &self.data.data_locations
+    }
+
     /// Look up a channel-level property by name.
     pub fn property(&self, name: &str) -> Option<&PropertyValue> {
         self.data.properties.get(name)

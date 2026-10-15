@@ -12,4 +12,5 @@ mod model;
 pub use api::reader::{OpenOptions, TdmsChannel, TdmsFile, TdmsGroup};
 pub use api::writer::{TdmsWriter, TdmsWriterOptions, WriterChannel, WriterGroup};
 pub use error::{Result, TdmsError};
+pub use model::channel::DataLocation;
 pub use model::datatypes::{DataType, PropertyValue};
