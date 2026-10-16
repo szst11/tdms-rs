@@ -19,6 +19,23 @@ skips beyond the buffer still seek the underlying stream. This applies to
 both data-file metadata scans and companion-index scans, without changing
 channel data locations or the on-disk format.
 
+Data-file metadata reads start with 64 KiB read-ahead. Four consecutive
+data-bearing segments whose skipped raw-data gaps are at most 64 KiB promote
+refills to 1 MiB. A larger gap immediately reduces subsequent refills to
+8 KiB and resets the dense-segment count; four nearby gaps are required to
+regrow. Metadata-only segments and incomplete final segments do not train
+the policy. Large gaps still use seeks, not sequential raw-data reads.
+Companion indexes contain contiguous metadata and use 1 MiB refills directly.
+
+The buffer allocation is bounded at 1 MiB per metadata scan. A small reader
+adapter limits the underlying read request on each refill; changing that limit
+never replaces the buffer or discards unread bytes. Previously fetched bytes
+remain usable after a policy change. Read-ahead may fetch skipped raw bytes,
+but does not decode them or retain whole channels. This layout-based policy
+reduces small-I/O latency on fragmented files without using path/drive guesses,
+timing-based tuning, or a public configuration option. It is not guaranteed to
+beat the smaller buffer on cached, CPU-bound scans.
+
 ### Companion Index Files (`.tdms_index`)
 When a sibling `<file>.tdms_index` exists (see `src/format/index.rs`), the reader
 prefers it for building the metadata index. The index file stores the same

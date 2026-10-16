@@ -2,7 +2,7 @@
 mod positioned;
 
 use positioned::PositionedReader;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::rc::Rc;
 
@@ -10,6 +10,7 @@ struct CountedStream {
     data: Cursor<Vec<u8>>,
     reads: Rc<Cell<usize>>,
     seeks: Rc<Cell<usize>>,
+    requests: Rc<RefCell<Vec<usize>>>,
     interrupt: bool,
     short_reads: bool,
 }
@@ -17,6 +18,7 @@ struct CountedStream {
 impl Read for CountedStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.reads.set(self.reads.get() + 1);
+        self.requests.borrow_mut().push(buf.len());
         if self.interrupt {
             self.interrupt = false;
             return Err(io::ErrorKind::Interrupted.into());
@@ -45,6 +47,7 @@ fn stream(data: Vec<u8>) -> (CountedStream, Rc<Cell<usize>>, Rc<Cell<usize>>) {
             data: Cursor::new(data),
             reads: reads.clone(),
             seeks: seeks.clone(),
+            requests: Rc::new(RefCell::new(Vec::new())),
             interrupt: false,
             short_reads: false,
         },
@@ -78,20 +81,20 @@ fn positions_and_buffered_skips_do_not_seek_the_file() -> io::Result<()> {
 
 #[test]
 fn skips_outside_buffer_and_end_relative_seeks() -> io::Result<()> {
-    let (source, _, seeks) = stream(vec![7; 30_000]);
+    let (source, _, seeks) = stream(vec![7; 300_000]);
     let mut reader = PositionedReader::new(source);
     let mut value = [0; 10];
     reader.read_exact(&mut value)?;
-    assert_eq!(reader.seek(SeekFrom::Start(20_000))?, 20_000);
+    assert_eq!(reader.seek(SeekFrom::Start(200_000))?, 200_000);
     assert_eq!(seeks.get(), 1);
     reader.read_exact(&mut value)?;
-    assert_eq!(reader.stream_position()?, 20_010);
+    assert_eq!(reader.stream_position()?, 200_010);
     assert_eq!(reader.seek(SeekFrom::Start(5))?, 5);
-    assert_eq!(reader.seek(SeekFrom::End(-3))?, 29_997);
+    assert_eq!(reader.seek(SeekFrom::End(-3))?, 299_997);
     assert_eq!(reader.read(&mut value)?, 3);
-    assert_eq!(reader.stream_position()?, 30_000);
+    assert_eq!(reader.stream_position()?, 300_000);
     assert_eq!(reader.read(&mut value)?, 0);
-    assert_eq!(reader.stream_position()?, 30_000);
+    assert_eq!(reader.stream_position()?, 300_000);
     assert_eq!(seeks.get(), 3);
     Ok(())
 }
@@ -148,5 +151,111 @@ fn large_absolute_seek_uses_absolute_fallback() -> io::Result<()> {
     assert_eq!(reader.stream_position()?, u64::MAX);
     assert_eq!(reader.seek(SeekFrom::Start(0))?, 0);
     assert_eq!(seeks.get(), 2);
+    Ok(())
+}
+
+#[test]
+fn growth_preserves_unread_bytes_and_buffered_backwards_seeks() -> io::Result<()> {
+    let data: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let (source, reads, seeks) = stream(data.clone());
+    let requests = source.requests.clone();
+    let mut reader = PositionedReader::new(source);
+    let mut value = [0];
+    reader.read_exact(&mut value)?;
+    for _ in 0..4 {
+        reader.observe_raw_gap(16 * 1024);
+    }
+    reader.seek(SeekFrom::Start(32))?;
+    let mut tail = vec![0; 64 * 1024 - 32];
+    reader.read_exact(&mut tail)?;
+    assert_eq!(tail, data[32..64 * 1024]);
+    assert_eq!(reads.get(), 1);
+    reader.read_exact(&mut value)?;
+    assert_eq!(value, [data[64 * 1024]]);
+    assert_eq!(*requests.borrow(), [64 * 1024, 1024 * 1024]);
+    assert_eq!(reader.stream_position()?, 64 * 1024 + 1);
+    assert_eq!(seeks.get(), 0);
+    Ok(())
+}
+
+#[test]
+fn sparse_gaps_shrink_refills_and_need_repeated_dense_evidence_to_regrow() -> io::Result<()> {
+    let data: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let (source, _, seeks) = stream(data.clone());
+    let requests = source.requests.clone();
+    let mut reader = PositionedReader::new(source);
+    let mut value = [0];
+    for _ in 0..4 {
+        reader.observe_raw_gap(1024);
+    }
+    reader.read_exact(&mut value)?;
+    reader.observe_raw_gap(2 * 1024 * 1024);
+    reader.seek(SeekFrom::Start(2 * 1024 * 1024))?;
+    reader.read_exact(&mut value)?;
+    assert_eq!(value, [data[2 * 1024 * 1024]]);
+    for _ in 0..3 {
+        reader.observe_raw_gap(64 * 1024);
+        reader.observe_raw_gap(0);
+    }
+    reader.seek(SeekFrom::Start(3 * 1024 * 1024))?;
+    reader.read_exact(&mut value)?;
+    assert_eq!(value, [data[3 * 1024 * 1024]]);
+    reader.observe_raw_gap(64 * 1024);
+    reader.seek(SeekFrom::Start(4 * 1024 * 1024))?;
+    reader.read_exact(&mut value)?;
+    assert_eq!(value, [data[4 * 1024 * 1024]]);
+    assert_eq!(
+        *requests.borrow(),
+        [1024 * 1024, 8 * 1024, 8 * 1024, 1024 * 1024]
+    );
+    assert_eq!(seeks.get(), 3);
+    Ok(())
+}
+
+#[test]
+fn metadata_only_segments_do_not_train_the_policy() -> io::Result<()> {
+    let (source, _, _) = stream(vec![9; 3 * 1024 * 1024]);
+    let requests = source.requests.clone();
+    let mut reader = PositionedReader::new(source);
+    for _ in 0..100 {
+        reader.observe_raw_gap(0);
+    }
+    let mut values = vec![0; 64 * 1024 + 1];
+    reader.read_exact(&mut values)?;
+    assert!(values.iter().all(|value| *value == 9));
+    assert_eq!(*requests.borrow(), [64 * 1024, 64 * 1024]);
+    Ok(())
+}
+
+#[test]
+fn index_reads_are_bounded_and_preserve_nearby_skips() -> io::Result<()> {
+    let (source, _, seeks) = stream(vec![5; 3 * 1024 * 1024]);
+    let requests = source.requests.clone();
+    let mut reader = PositionedReader::new_index(source);
+    let mut value = [0];
+    reader.read_exact(&mut value)?;
+    reader.seek(SeekFrom::Start(900_000))?;
+    reader.read_exact(&mut value)?;
+    assert_eq!(seeks.get(), 0);
+    reader.seek(SeekFrom::Start(2 * 1024 * 1024))?;
+    let mut rest = vec![0; 2 * 1024 * 1024];
+    assert_eq!(reader.read(&mut rest)?, 1024 * 1024);
+    assert_eq!(reader.stream_position()?, 3 * 1024 * 1024);
+    assert_eq!(*requests.borrow(), [1024 * 1024, 1024 * 1024]);
+    assert_eq!(seeks.get(), 1);
+    Ok(())
+}
+
+#[test]
+fn direct_large_reads_still_obey_the_current_read_ahead_limit() -> io::Result<()> {
+    let (source, _, _) = stream(vec![3; 3 * 1024 * 1024]);
+    let requests = source.requests.clone();
+    let mut reader = PositionedReader::new(source);
+    let mut values = vec![0; 2 * 1024 * 1024];
+    assert_eq!(reader.read(&mut values)?, 64 * 1024);
+    reader.observe_raw_gap(64 * 1024 + 1);
+    assert_eq!(reader.read(&mut values)?, 8 * 1024);
+    assert_eq!(reader.stream_position()?, 72 * 1024);
+    assert_eq!(*requests.borrow(), [64 * 1024, 8 * 1024]);
     Ok(())
 }

@@ -220,7 +220,7 @@ impl OpenOptions {
 
     fn parse_segments_from_path(path: &Path, is_index_file: bool) -> Result<(Vec<Segment>, u64)> {
         let file = File::open(path)?;
-        let mut reader = TdmsReaderInternal::new(PositionedReader::new(file), is_index_file);
+        let mut reader = TdmsReaderInternal::new(file, is_index_file);
         let mut segments = Vec::new();
 
         loop {
@@ -752,7 +752,7 @@ impl Pod for f64 {}
 impl Pod for bool {}
 
 struct TdmsReaderInternal<R: Read + Seek> {
-    reader: R,
+    reader: PositionedReader<R>,
     is_index_file: bool,
     /// Start of the current segment as it appears in the `.tdms` data file.
     ///
@@ -768,7 +768,11 @@ struct TdmsReaderInternal<R: Read + Seek> {
 impl<R: Read + Seek> TdmsReaderInternal<R> {
     fn new(reader: R, is_index_file: bool) -> Self {
         Self {
-            reader,
+            reader: if is_index_file {
+                PositionedReader::new_index(reader)
+            } else {
+                PositionedReader::new(reader)
+            },
             is_index_file,
             data_segment_start: 0,
             active_meta: std::collections::HashMap::new(),
@@ -1036,6 +1040,13 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             current_raw_offset
         };
 
+        if !self.is_index_file
+            && next_segment_offset != INCOMPLETE_SEGMENT_OFFSET
+            && next_segment_offset > raw_data_offset
+        {
+            self.reader
+                .observe_raw_gap(target_pos.saturating_sub(metadata_end));
+        }
         if metadata_end != target_pos {
             self.reader.seek(SeekFrom::Start(target_pos))?;
         }
