@@ -36,6 +36,33 @@ reduces small-I/O latency on fragmented files without using path/drive guesses,
 timing-based tuning, or a public configuration option. It is not guaranteed to
 beat the smaller buffer on cached, CPU-bound scans.
 
+### Object Identities
+
+The metadata reader interns each distinct raw object path once per file,
+assigning it an integer ID and parsing its group/channel components only on
+first appearance. Path bytes are read through a reusable scratch buffer.
+Object order and active raw-data metadata use these IDs rather than cloned
+path strings. New object lists can reorder or omit objects without changing
+their identities; continuation segments reuse the most recent order and
+raw-data layouts.
+
+Each segment object shares its canonical `ObjectPath` through `Arc`, so parsed
+paths remain alive after the reader's lookup tables are dropped. Model
+construction caches the root/group/channel target for each ID and uses stable
+`IndexMap` indices instead of allocating names and looking them up again for
+every appearance. Property updates, data-type updates, fragment locations,
+sample counts, and first-appearance group/channel order retain their existing
+semantics. IDs are private, file-local state and are not serialized.
+
+Segments are still retained before constructing the final model. This is
+object-ID reuse, not streaming model construction; the retained metadata also
+continues to support companion-index regeneration without changing its format.
+The generated regression in `tests/object_id_reuse.rs` exercises reordered,
+omitted and late-added objects, reused raw metadata, metadata-only updates,
+continuations, padding, strings and mixed numeric types. It checks exact
+fragment offsets, whole/range reads and generated-index equivalence, including
+an index-only read that cannot silently fall back to data-file parsing.
+
 ### Companion Index Files (`.tdms_index`)
 When a sibling `<file>.tdms_index` exists (see `src/format/index.rs`), the reader
 prefers it for building the metadata index. The index file stores the same

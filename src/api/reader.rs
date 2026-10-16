@@ -1,6 +1,6 @@
 use crate::error::{Result, TdmsError};
 use crate::format::index::{index_path_for, raw_data_size, write_index_file, TOC_BIG_ENDIAN};
-use crate::format::metadata::ParsingMetadata;
+use crate::format::metadata::{ObjectPath, ParsingMetadata, RawDataMeta};
 use crate::format::segment::Segment;
 use crate::io::ext::{TdmsEndian, TdmsReadExt};
 use crate::io::positioned::PositionedReader;
@@ -9,10 +9,12 @@ use crate::model::datatypes::{DataType, PropertyValue};
 use crate::model::file::TdmsFileInner;
 use crate::model::group::TdmsGroupData;
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
 struct StringReadTask<'a> {
     location: &'a DataLocation,
@@ -245,34 +247,95 @@ impl OpenOptions {
     }
 
     fn build_inner(path: &Path, segments: &[Segment]) -> TdmsFileInner {
-        let mut groups = IndexMap::new();
+        #[derive(Clone, Copy)]
+        enum Target {
+            Root,
+            Group(usize),
+            Channel(usize, usize),
+            Ignored,
+        }
+
+        let mut groups: IndexMap<String, TdmsGroupData> = IndexMap::new();
         let mut file_properties = IndexMap::new();
+        let mut targets = Vec::new();
 
         for segment in segments {
             for obj in &segment.objects {
-                if let Some(g_name) = obj.path.group_name() {
-                    let group = groups
-                        .entry(g_name.to_string())
-                        .or_insert_with(|| TdmsGroupData {
-                            name: g_name.to_string(),
-                            channels: IndexMap::new(),
-                            properties: IndexMap::new(),
-                        });
-
-                    if let Some(c_name) = obj.path.channel_name() {
-                        let channel =
-                            group.channels.entry(c_name.to_string()).or_insert_with(|| {
-                                TdmsChannelData {
-                                    name: c_name.to_string(),
-                                    dtype: DataType::Double,
-                                    len: 0,
-                                    data_locations: Vec::new(),
-                                    properties: IndexMap::new(),
+                let id = obj.path.id;
+                if targets.len() <= id {
+                    targets.resize(id + 1, None);
+                }
+                let target = match targets[id] {
+                    Some(target) => target,
+                    None => {
+                        let target = if let Some(g_name) = obj.path.group_name() {
+                            let group_index = match groups.get_index_of(g_name) {
+                                Some(index) => index,
+                                None => {
+                                    groups
+                                        .insert_full(
+                                            g_name.to_owned(),
+                                            TdmsGroupData {
+                                                name: g_name.to_owned(),
+                                                channels: IndexMap::new(),
+                                                properties: IndexMap::new(),
+                                            },
+                                        )
+                                        .0
                                 }
-                            });
-
+                            };
+                            if let Some(c_name) = obj.path.channel_name() {
+                                let group = groups
+                                    .get_index_mut(group_index)
+                                    .expect("resolved group index")
+                                    .1;
+                                let channel_index = match group.channels.get_index_of(c_name) {
+                                    Some(index) => index,
+                                    None => {
+                                        group
+                                            .channels
+                                            .insert_full(
+                                                c_name.to_owned(),
+                                                TdmsChannelData {
+                                                    name: c_name.to_owned(),
+                                                    dtype: DataType::Double,
+                                                    len: 0,
+                                                    data_locations: Vec::new(),
+                                                    properties: IndexMap::new(),
+                                                },
+                                            )
+                                            .0
+                                    }
+                                };
+                                Target::Channel(group_index, channel_index)
+                            } else {
+                                Target::Group(group_index)
+                            }
+                        } else if obj.path.is_root() {
+                            Target::Root
+                        } else {
+                            Target::Ignored
+                        };
+                        targets[id] = Some(target);
+                        target
+                    }
+                };
+                match target {
+                    Target::Root => file_properties.extend(obj.properties.clone()),
+                    Target::Group(group) => groups
+                        .get_index_mut(group)
+                        .expect("resolved group index")
+                        .1
+                        .properties
+                        .extend(obj.properties.clone()),
+                    Target::Channel(group, channel) => {
+                        let group = groups.get_index_mut(group).expect("resolved group index").1;
+                        let channel = group
+                            .channels
+                            .get_index_mut(channel)
+                            .expect("resolved channel index")
+                            .1;
                         channel.properties.extend(obj.properties.clone());
-
                         if let Some(loc) = &obj.data_location {
                             channel.len += loc.number_of_values as usize;
                             channel.data_locations.push(DataLocation {
@@ -281,15 +344,11 @@ impl OpenOptions {
                                 big_endian: loc.big_endian,
                             });
                         }
-
                         if let Some(meta) = &obj.raw_data_meta {
                             channel.dtype = meta.data_type;
                         }
-                    } else {
-                        group.properties.extend(obj.properties.clone());
                     }
-                } else if obj.path.is_root() {
-                    file_properties.extend(obj.properties.clone());
+                    Target::Ignored => {}
                 }
             }
         }
@@ -761,8 +820,11 @@ struct TdmsReaderInternal<R: Read + Seek> {
     /// segments, so the data-file equivalent must be tracked separately: raw
     /// data locations are resolved against the data file, not the index.
     data_segment_start: u64,
-    active_meta: std::collections::HashMap<String, crate::format::metadata::RawDataMeta>,
-    object_order: Vec<String>,
+    active_meta: Vec<Option<RawDataMeta>>,
+    object_order: Vec<usize>,
+    path_ids: HashMap<String, usize>,
+    object_paths: Vec<Arc<ObjectPath>>,
+    path_buffer: Vec<u8>,
 }
 
 impl<R: Read + Seek> TdmsReaderInternal<R> {
@@ -775,8 +837,11 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
             },
             is_index_file,
             data_segment_start: 0,
-            active_meta: std::collections::HashMap::new(),
+            active_meta: Vec::new(),
             object_order: Vec::new(),
+            path_ids: HashMap::new(),
+            object_paths: Vec::new(),
+            path_buffer: Vec::new(),
         }
     }
 
@@ -839,11 +904,21 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
 
             for _ in 0..count {
                 let path_len = self.reader.read_u32_endian(endian)?;
-                let mut path_bytes = vec![0u8; path_len as usize];
-                self.reader.read_exact(&mut path_bytes)?;
-                let path_str =
-                    String::from_utf8(path_bytes).map_err(|_| TdmsError::StringEncoding)?;
-                self.object_order.push(path_str.clone());
+                self.path_buffer.resize(path_len as usize, 0);
+                self.reader.read_exact(&mut self.path_buffer)?;
+                let path_str = std::str::from_utf8(&self.path_buffer)
+                    .map_err(|_| TdmsError::StringEncoding)?;
+                let id = if let Some(id) = self.path_ids.get(path_str) {
+                    *id
+                } else {
+                    let id = self.object_paths.len();
+                    let path = Arc::new(ObjectPath::new(id, path_str.to_owned()));
+                    self.path_ids.insert(path.raw.clone(), id);
+                    self.object_paths.push(path);
+                    self.active_meta.push(None);
+                    id
+                };
+                self.object_order.push(id);
 
                 let raw_data_index = self.reader.read_u32_endian(endian)?;
                 let mut raw_data_meta = None;
@@ -866,7 +941,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                         count = self.reader.read_u64_endian(endian)?;
                         total_size = Some(self.reader.read_u64_endian(endian)?);
                         prop_count = self.reader.read_u32_endian(endian)?;
-                        raw_data_meta = Some(crate::format::metadata::RawDataMeta {
+                        raw_data_meta = Some(RawDataMeta {
                             data_type,
                             number_of_values: count,
                             total_size_bytes: total_size,
@@ -886,7 +961,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                         let mut end_slice = &skipped[start..];
                         prop_count = end_slice.read_u32_endian(endian)?;
 
-                        raw_data_meta = Some(crate::format::metadata::RawDataMeta {
+                        raw_data_meta = Some(RawDataMeta {
                             data_type,
                             number_of_values: count,
                             total_size_bytes: total_size,
@@ -963,7 +1038,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                 }
 
                 objects.push(ParsingMetadata {
-                    path: crate::format::metadata::ObjectPath::new(path_str),
+                    path: Arc::clone(&self.object_paths[id]),
                     raw_data_index,
                     properties,
                     raw_data_meta,
@@ -971,9 +1046,9 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                 });
             }
         } else {
-            for path_str in &self.object_order {
+            for &id in &self.object_order {
                 objects.push(ParsingMetadata {
-                    path: crate::format::metadata::ObjectPath::new(path_str.clone()),
+                    path: Arc::clone(&self.object_paths[id]),
                     raw_data_index: 0,
                     properties: std::collections::HashMap::new(),
                     raw_data_meta: None,
@@ -986,9 +1061,9 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
         let mut current_raw_offset = data_start + LEAD_IN_LEN + raw_data_offset;
 
         for obj in &mut objects {
-            let path_str = obj.path.raw.clone();
+            let id = obj.path.id;
             if let Some(meta) = &obj.raw_data_meta {
-                self.active_meta.insert(path_str.clone(), meta.clone());
+                self.active_meta[id] = Some(meta.clone());
                 if meta.number_of_values > 0 {
                     let size = raw_data_size(meta);
                     obj.data_location = Some(crate::format::metadata::DataLocation {
@@ -1001,7 +1076,7 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                     current_raw_offset += size;
                 }
             } else if obj.raw_data_index == 0 {
-                if let Some(meta) = self.active_meta.get(&path_str) {
+                if let Some(meta) = self.active_meta[id].as_ref() {
                     if meta.number_of_values > 0 {
                         let size = raw_data_size(meta);
                         obj.data_location = Some(crate::format::metadata::DataLocation {

@@ -1,14 +1,17 @@
 use crate::model::datatypes::{DataType, PropertyValue};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectPath {
+    /// File-local identity; never serialized into TDMS or index files.
+    pub id: usize,
     pub raw: String,
     pub components: Vec<String>,
 }
 
 impl ObjectPath {
-    pub fn new(path: String) -> Self {
+    pub fn new(id: usize, path: String) -> Self {
         let mut components = Vec::new();
         let mut current = String::new();
         let mut in_quote = false;
@@ -35,6 +38,7 @@ impl ObjectPath {
         }
 
         Self {
+            id,
             raw: path,
             components,
         }
@@ -80,7 +84,7 @@ pub struct DataLocation {
 
 #[derive(Debug)]
 pub struct ParsingMetadata {
-    pub path: ObjectPath,
+    pub path: Arc<ObjectPath>,
     pub raw_data_index: u32,
     pub properties: HashMap<String, PropertyValue>,
     pub raw_data_meta: Option<RawDataMeta>,
