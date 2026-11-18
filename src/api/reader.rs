@@ -1028,8 +1028,21 @@ impl<R: Read + Seek> TdmsReaderInternal<R> {
                                     Ok(PropertyValue::String(s))
                                 }
                                 DataType::TimeStamp => {
-                                    let fraction = self.reader.read_u64_endian(endian)?;
-                                    let seconds = self.reader.read_i64_endian(endian)?;
+                                    // TDMS stores the fraction before the seconds in
+                                    // little-endian files, but seconds before the
+                                    // fraction in big-endian files (see npTDMS).
+                                    let (seconds, fraction) = match endian {
+                                        TdmsEndian::Little => {
+                                            let fraction = self.reader.read_u64_endian(endian)?;
+                                            let seconds = self.reader.read_i64_endian(endian)?;
+                                            (seconds, fraction)
+                                        }
+                                        TdmsEndian::Big => {
+                                            let seconds = self.reader.read_i64_endian(endian)?;
+                                            let fraction = self.reader.read_u64_endian(endian)?;
+                                            (seconds, fraction)
+                                        }
+                                    };
                                     Ok(PropertyValue::TimeStamp((seconds, fraction)))
                                 }
                             }
